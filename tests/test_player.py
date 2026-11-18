@@ -10,6 +10,7 @@ import requests
 from bot import Player, Worker
 from memory import MemoryStore
 from play import TurnBudget, project
+from rules import rules_for
 
 
 GAME = {
@@ -197,8 +198,10 @@ class PlayerTests(unittest.TestCase):
         self.assertIsNone(worker.fetch_review(lookup))
         self.assertEqual(worker.fetch_review(lookup), {"transcript": "completed replay"})
         self.assertEqual(sum(path.endswith("/review") for _, path in api.calls), 1)
-        self.assertEqual(worker.model_review({"game_code": GAME["game_code"]}), {"lessons": []})
+        context = {"game_code": GAME["game_code"], "rule_variant": "english"}
+        self.assertEqual(worker.model_review(context), {"lessons": []})
         self.assertEqual(provider.requests[0]["purpose"], "review")
+        self.assertIn(rules_for("english"), provider.requests[0]["instructions"])
 
 
 if __name__ == "__main__":

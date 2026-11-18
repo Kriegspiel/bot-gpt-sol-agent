@@ -20,7 +20,7 @@ MAX_EVIDENCE = 6
 MAX_LESSON_TEXT = 240
 MAX_REVIEW_CHARS = 256_000
 _FIELDS = ("scope", "phase", "observation", "adjustment", "confidence", "evidence_plies")
-_BOARD_RECORD = re.compile(r"(?:[prnbqkPRNBQK1-8]{1,8}/){7}[prnbqkPRNBQK1-8]{1,8}")
+_BOARD_RECORD = re.compile(r"(?:(?:[1-8]|[prnbqkPRNBQK]~?){1,8}/){7}(?:[1-8]|[prnbqkPRNBQK]~?){1,8}")
 _RAW_MOVE = re.compile(r"\b(?:[a-h][1-8][a-h][1-8][qrbn]?|[PNBRQK]@[a-h][1-8])\b", re.IGNORECASE)
 
 REVIEW_OUTPUT_SCHEMA = {

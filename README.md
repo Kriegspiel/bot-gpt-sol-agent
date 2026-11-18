@@ -1,15 +1,17 @@
 # GPT Sol Agent
 
-`agent_gpt_sol` plays [Berkeley + Any Kriegspiel](https://kriegspiel.org/rules/berkeley)
-as a separate T4 Expert account. One service owns the identity, with a runner
-per assigned game and up to two concurrent live model requests. When both
-slots are busy, a turn can wait up to three seconds while leaving time for
-inference and the fallback move submission.
+`agent_gpt_sol` is a T4 Expert bot for all seven playable Kriegspiel rulesets.
+It supports Berkeley, Berkeley + Any, Cincinnati, Wild 16, RAND, English, and
+CrazyKrieg. See the [ruleset references](rules.md). One service owns the
+identity, with a runner per assigned game and up to two concurrent live
+model requests. When both slots are busy, a turn can wait up to three seconds
+while leaving time for inference and the fallback move submission.
 
-The live player reasons from its projected board, referee announcements,
-clock, and the opponent's public name, role and rating. The runner budgets
-from the server clock and can submit a locally ranked attempt when inference
-is slow or unavailable. It rechecks the state after a model request, re-ranks
+The live player reasons from the assigned ruleset, its projected board, referee
+announcements, clock, and the opponent's public name, role and rating. For
+CrazyKrieg it reads the public reserves and can submit drop attempts. The
+runner budgets from the server clock and can submit a locally ranked attempt
+when inference is slow or unavailable. It rechecks the state after a model request, re-ranks
 after every referee answer and journals submission intents before posting them.
 
 A separate worker reviews one of the agent's own completed games at a time,
@@ -17,9 +19,9 @@ even while other games are active. It uses a separate model request slot and
 can compare full replay with the evidence available to the player at the time.
 It proposes bounded lessons with evidence and confidence, either general or
 scoped to an opponent's stable account ID. A game uses a frozen set of approved
-lessons. The live provider prompt receives approved summaries and public
-opponent context. Keep the SQLite database private. It contains player-visible referee and
-decision evidence and is created under a restrictive process umask.
+lessons for its ruleset. The live provider prompt receives approved summaries and public
+opponent context. Keep the SQLite database private. It contains player-visible
+referee and decision evidence and is created under a restrictive process umask.
 
 ## Run locally
 

@@ -104,7 +104,9 @@ class ReviewTests(unittest.TestCase):
     def test_memory_advice_rejects_private_replay_and_invalid_evidence(self):
         game = self.store.pending_games()[0]
         for field, value in (
-            ("observation", FULL_FEN), ("adjustment", "Play d2d4 here"), ("adjustment", "Try N@e4"),
+            ("observation", FULL_FEN),
+            ("observation", "4k3/8/8/8/3Q~4/8/8/4K3[Pb] w - - 0 1"),
+            ("adjustment", "Play d2d4 here"), ("adjustment", "Try N@e4"),
             ("adjustment", "Replay PLAY23"), ("evidence_plies", [2]), ("evidence_plies", [True]),
             ("evidence_plies", []),
         ):
