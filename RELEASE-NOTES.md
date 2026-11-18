@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.2.0
+
+- Advertise and play all seven supported rulesets through the existing T4 account.
+- Use variant-specific referee guidance in live play and completed-game review,
+  including CrazyKrieg reserve pieces, drops, and promotions.
+- Preserve the hidden-board boundary and scope lessons to the game ruleset.
+
 ## 0.1.2
 
 - Admit up to two simultaneous live requests. If both slots are busy, wait

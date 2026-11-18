@@ -17,17 +17,18 @@ import requests
 
 from memory import MemoryStore
 from play import (
-    PLAN_SCHEMA, PLAY_INSTRUCTIONS, VARIANT, TurnBudget, clock_seconds, fallback_rank, full_move_number,
-    model_context, parse_plan, project, turn_key,
+    PLAN_SCHEMA, TurnBudget, clock_seconds, fallback_rank, full_move_number,
+    model_context, parse_plan, play_instructions, project, turn_key,
 )
 from provider import MIN_PLAY_REQUEST_SECONDS, ModelUnavailable, Provider
 from provider_budget import MonthlyBudgetLedger
 from review import REVIEW_INSTRUCTIONS, REVIEW_OUTPUT_SCHEMA, ReviewWorker
+from rules import SUPPORTED_VARIANTS, rules_for
 
 LOG = logging.getLogger(__name__)
 USERNAME = "agent_gpt_sol"
 DISPLAY_NAME = "GPT Sol Agent"
-DESCRIPTION = "Plays Berkeley + Any with clock-aware reasoning and lessons from completed games."
+DESCRIPTION = "Plays all seven supported Kriegspiel rulesets with clock-aware reasoning and lessons from completed games."
 AUTHOR_NOTE = (
     "GPT Sol Agent reasons from its own board and the referee's announcements. "
     "It reviews its completed games and retains approved lessons, which may include opponent tendencies. "
@@ -99,6 +100,8 @@ class Player:
     ) -> None:
         self.game_id = game["game_id"]
         self.game_code = game["game_code"]
+        self.variant = game["rule_variant"]
+        self.instructions = play_instructions(self.variant)
         self.color = player_color(game)
         opponent_color = "black" if self.color == "white" else "white"
         opponent = game[opponent_color]
@@ -112,7 +115,7 @@ class Player:
         self.budget = None
         self.model_calls = 0
         self.lessons = memory.open_game(
-            self.game_id, game_code=self.game_code, variant=VARIANT, own_color=self.color,
+            self.game_id, game_code=self.game_code, variant=self.variant, own_color=self.color,
             opponent_key=game.get("opponent_id"), opponent_role=opponent["role"],
             opponent_elo=opponent.get("elo"),
         )
@@ -122,7 +125,7 @@ class Player:
         state = self.api.get(f"/game/{self.game_id}/state", timeout=timeout)
         if state.get("state") != "active":
             return {"state": state.get("state")}, sampled_at
-        return project(state, self.color), sampled_at
+        return project(state, self.color, self.variant), sampled_at
 
     def play(self, state: dict, sampled_at: float, stop: threading.Event) -> None:
         expected = turn_key(state)
@@ -148,7 +151,7 @@ class Player:
                     lessons=self.lessons, opponent=self.opponent, budget_seconds=model_seconds,
                 )
                 future = self.provider.start(
-                    purpose="play", game_id=self.game_id, instructions=PLAY_INSTRUCTIONS,
+                    purpose="play", game_id=self.game_id, instructions=self.instructions,
                     context=context, schema=PLAN_SCHEMA, deadline=budget.model_until,
                     effort="medium" if model_seconds >= 18 else "low",
                     max_tokens=2048 if model_seconds >= 18 else 1024,
@@ -199,10 +202,7 @@ class Player:
                 return
             self.memory.record_attempt(
                 self.game_id, turn_key=journal_key, action=action, decision=decision,
-                answer={field: answer[field] for field in (
-                    "move_done", "announcement", "special_announcement", "checks", "capture_square",
-                    "game_over", "has_any", "clock",
-                ) if field in answer},
+                answer=answer,
             )
             LOG.info(
                 "attempt game=%s source=%s accepted=%s elapsed_seconds=%.3f",
@@ -270,7 +270,8 @@ class Worker:
         deadline = time.monotonic() + 65
         future = self.provider.start(
             purpose="review", game_id=context["game_code"], context=context,
-            instructions=REVIEW_INSTRUCTIONS, schema=REVIEW_OUTPUT_SCHEMA, deadline=deadline,
+            instructions=f"{REVIEW_INSTRUCTIONS}\n\n{rules_for(context['rule_variant'])}",
+            schema=REVIEW_OUTPUT_SCHEMA, deadline=deadline,
             effort="medium", max_tokens=4096,
         )
         if future is None:
@@ -306,7 +307,7 @@ class Worker:
         games = self.api.get("/game/mine/active?limit=100")["games"]
         self.runners = {key: thread for key, thread in self.runners.items() if thread.is_alive()}
         for game in games:
-            if game.get("state") != "active" or game.get("rule_variant") != VARIANT or not player_color(game):
+            if game.get("state") != "active" or game.get("rule_variant") not in SUPPORTED_VARIANTS or not player_color(game):
                 continue
             if game["game_id"] in self.runners or not GAME_ID.fullmatch(game["game_id"]):
                 continue
@@ -317,7 +318,8 @@ class Worker:
 
     def run(self) -> None:
         self.api.post("/bots/profile", {
-            "supported_rule_variants": [VARIANT],
+            "description": DESCRIPTION,
+            "supported_rule_variants": list(SUPPORTED_VARIANTS),
             "author_note": f"OpenAI {self.provider.model}. {AUTHOR_NOTE}",
         })
         review_thread = threading.Thread(target=self.review_loop, name="postgame", daemon=True)
@@ -374,7 +376,7 @@ def main() -> None:
             "username": USERNAME, "display_name": DISPLAY_NAME, "description": DESCRIPTION,
             "author_note": AUTHOR_NOTE, "listed": os.getenv("KRIEGSPIEL_BOT_LISTED", "false") == "true",
             "owner_email": os.getenv("KRIEGSPIEL_BOT_OWNER_EMAIL", "bot-gpt-sol-agent@kriegspiel.org"),
-            "supported_rule_variants": [VARIANT],
+            "supported_rule_variants": list(SUPPORTED_VARIANTS),
         })
         print(registration["api_token"])
         return
