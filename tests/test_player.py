@@ -129,7 +129,7 @@ class PlayerTests(unittest.TestCase):
 
     def test_ask_any_reranks_under_same_turn_deadline(self):
         live = state(remaining=1000)
-        after_any = state(remaining=990, actions=("d2e3",), ask=False)
+        after_any = {**state(remaining=990, actions=("d2e3",), ask=False), "ply_count": live["ply_count"] + 1}
         provider = FakeProvider(
             {"attempts": ["ask_any"], "hypotheses": ["A pawn capture may be possible"], "rationale": "information"},
             {"attempts": ["d2e3"], "hypotheses": [], "rationale": "must capture"},
@@ -150,6 +150,15 @@ class PlayerTests(unittest.TestCase):
         self.create(provider, first).play(project(live, "white"), 100, threading.Event())
         self.create(provider, second).play(project(live, "white"), 100, threading.Event())
         self.assertNotEqual(first.calls[0][2], second.calls[0][2])
+
+    def test_prior_referee_rejection_is_excluded_at_full_move_index(self):
+        live = state(remaining=4, ask=False)
+        live["referee_turns"][0]["white"].append({
+            "actor": "self", "kind": "illegal_move", "message": "Refused", "move_uci": "e2e4",
+        })
+        api = FakeAPI([], [{"move_done": True}])
+        self.create(FakeProvider(), api).play(project(live, "white"), 100, threading.Event())
+        self.assertEqual(api.calls[0][2], {"uci": "d2d4"})
 
     def test_paused_first_move_has_cap(self):
         live = state(remaining=1500, active_color=None)

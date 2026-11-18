@@ -17,7 +17,7 @@ import requests
 
 from memory import MemoryStore
 from play import (
-    PLAN_SCHEMA, PLAY_INSTRUCTIONS, VARIANT, TurnBudget, clock_seconds, fallback_rank,
+    PLAN_SCHEMA, PLAY_INSTRUCTIONS, VARIANT, TurnBudget, clock_seconds, fallback_rank, full_move_number,
     model_context, parse_plan, project, turn_key,
 )
 from provider import ModelUnavailable, Provider
@@ -86,7 +86,7 @@ def ongoing_rejections(state: dict) -> set[str]:
     return {
         item["move_uci"]
         for turn in state["referee_turns"][-2:]
-        if turn["turn"] == state["move_number"]
+        if turn["turn"] == full_move_number(state)
         for item in turn[side]
         if item.get("kind") == "illegal_move" and item.get("move_uci")
     }
@@ -132,7 +132,7 @@ class Player:
             self.budget = TurnBudget.start(state, sampled_at, self.turn_started)
             self.model_calls = 0
         budget = self.budget
-        journal_key = f"{self.color}:{state['ply_count']}"
+        journal_key = f"{self.color}:{state['move_number']}"
         rejected = self.memory.tried_actions(self.game_id, journal_key) | ongoing_rejections(state)
         self.memory.record_observation(self.game_id, state)
         while not stop.is_set() and turn_key(state) == expected:
@@ -166,9 +166,12 @@ class Player:
                     seconds = budget.act_until - self.now()
                     if seconds <= 0:
                         return
+                    last_referee_index = state["ply_count"]
                     state, sampled_at = self.poll(timeout=min(1.5, seconds))
                     if state["state"] != "active" or turn_key(state) != expected:
                         return
+                    if state["ply_count"] != last_referee_index:
+                        ranked = []
                     candidates = fallback_rank(state, rejected | ongoing_rejections(state))
                     if not candidates:
                         return
