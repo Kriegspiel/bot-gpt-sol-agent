@@ -247,7 +247,8 @@ class MemoryStore:
             value = json.loads(row["payload"])
             if row["kind"] == "observation":
                 context.append({
-                    "turn": row["turn_key"],
+                    "turn": f"{value.get('turn')}:{value.get('move_number')}",
+                    "referee_event_index": value.get("ply_count"),
                     "clock_at_start": value["clock"],
                     "recent_referee_at_start": value["referee_turns"],
                 })

@@ -56,7 +56,7 @@ def referee_turns(state: dict) -> list[dict]:
                 if not isinstance(entry, dict) or entry.get("actor") not in {"self", "opponent", None}:
                     continue
                 item = {field: entry[field] for field in ("kind", "actor", "message") if field in entry}
-                if entry.get("actor") == "self" and entry.get("move_uci"):
+                if color == state["your_color"] and entry.get("actor") == "self" and entry.get("move_uci"):
                     item["move_uci"] = entry["move_uci"]
                 entries.append(item)
             safe[color] = entries
@@ -91,8 +91,13 @@ def permitted(state: dict) -> list[str]:
     return [*moves, "ask_any"] if "ask_any" in state["possible_actions"] else moves
 
 
+def full_move_number(state: dict) -> int:
+    return (state["move_number"] + 1) // 2
+
+
 def turn_key(state: dict) -> tuple[str, int]:
-    return state["turn"], state["ply_count"]
+    # The API ply_count also advances on rejected attempts and Ask Any.
+    return state["turn"], state["move_number"]
 
 
 def clock_seconds(state: dict, sampled_at: float, now: float) -> float:
@@ -148,7 +153,7 @@ def fallback_rank(state: dict, rejected: set[str]) -> list[str]:
         value = 12 if target == recapture_square else 0
         if len(action) == 5:
             value += 22 if action.endswith("q") else 16
-        if state["move_number"] <= 12:
+        if full_move_number(state) <= 12:
             if piece in {"n", "b"} and origin[1] in "18":
                 value += 5
             if piece == "p" and action[0] == action[2]:
@@ -184,7 +189,7 @@ def model_context(
     return {
         "ruleset": VARIANT,
         "side": state["your_color"],
-        "move_number": state["move_number"],
+        "move_number": full_move_number(state),
         "your_fen": state["your_fen"],
         "material": state["material_summary"],
         "referee_turns": state["referee_turns"][-10:],

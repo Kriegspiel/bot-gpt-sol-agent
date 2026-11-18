@@ -29,7 +29,7 @@ Set the following in the process environment or in a private file passed with
 | `KRIEGSPIEL_API_BASE` | Game API base URL |
 | `KRIEGSPIEL_BOT_TOKEN` | Token for the `agent_gpt_sol` identity |
 | `LLM_API_KEY` | Direct OpenAI API key |
-| `LLM_MODEL` | Defaults to the platform's configured `gpt-6.1-sol` |
+| `LLM_MODEL` | Defaults to `gpt-6.2-sol`. The operator verifies model access on the production key. |
 | `OPENAI_MONTHLY_BUDGET_USD` | Existing host-wide provider ceiling |
 | `OPENAI_MONTHLY_BUDGET_STATE_PATH` | The existing shared provider ledger |
 | `AGENT_USE_MEMORY` | Set to `false` for a match without retrieved lessons |

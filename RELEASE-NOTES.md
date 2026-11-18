@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.1.1
+
+- Preserve the clock budget and attempt journal across referee probes.
+- Match prior referee rejections to the chess move number.
+- Support GPT-6.2 Sol on Responses in the standard service tier and include cache-write charges in usage estimates.
+
 ## 0.1.0
 
 - Add the T4 GPT Sol Agent for Berkeley + Any.
