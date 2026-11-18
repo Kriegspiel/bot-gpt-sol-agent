@@ -3,6 +3,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 import requests
 
@@ -127,6 +128,24 @@ class PlayerTests(unittest.TestCase):
         self.assertLess(future.sampled_timeout, 10)
         self.assertEqual(api.calls[-1][0], "POST")
 
+    def test_fallback_submission_survives_bounded_provider_admission(self):
+        now = [100.0]
+        live = state(remaining=1500)
+        answer = {"move_done": True}
+        api = FakeAPI([], [answer])
+        provider = Mock()
+
+        def admission(*, deadline, **_):
+            now[0] = deadline
+            return None
+
+        provider.start.side_effect = admission
+        player = Player(GAME, api, self.memory, provider, now=lambda: now[0])
+        player.play(project(live, "white"), 100, threading.Event())
+        provider.start.assert_called_once()
+        self.assertLess(now[0], player.budget.act_until)
+        self.assertEqual(api.calls[0][0], "POST")
+
     def test_ask_any_reranks_under_same_turn_deadline(self):
         live = state(remaining=1000)
         after_any = {**state(remaining=990, actions=("d2e3",), ask=False), "ply_count": live["ply_count"] + 1}
@@ -170,12 +189,16 @@ class PlayerTests(unittest.TestCase):
         completed = {**GAME, "state": "completed"}
         mismatch = {**completed, "white": {"username": "someone_else"}}
         api = FakeAPI([active, mismatch, completed, {"transcript": "completed replay"}], [])
-        worker = Worker(api, self.memory, None, None)
+        provider = FakeProvider({"lessons": []})
+        worker = Worker(api, self.memory, provider, None)
+        worker.runners["unrelated_active_game"] = Mock(is_alive=lambda: True)
         lookup = GAME["game_id"]
         self.assertIsNone(worker.fetch_review(lookup))
         self.assertIsNone(worker.fetch_review(lookup))
         self.assertEqual(worker.fetch_review(lookup), {"transcript": "completed replay"})
         self.assertEqual(sum(path.endswith("/review") for _, path in api.calls), 1)
+        self.assertEqual(worker.model_review({"game_code": GAME["game_code"]}), {"lessons": []})
+        self.assertEqual(provider.requests[0]["purpose"], "review")
 
 
 if __name__ == "__main__":

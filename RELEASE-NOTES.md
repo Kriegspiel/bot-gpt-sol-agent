@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.1.2
+
+- Admit up to two simultaneous live requests. If both slots are busy, wait
+  briefly within the existing turn deadline before using local fallback.
+- Review completed games in a separate slot while other games are active.
+  Review rate limits pause only the review worker.
+
 ## 0.1.1
 
 - Preserve the clock budget and attempt journal across referee probes.

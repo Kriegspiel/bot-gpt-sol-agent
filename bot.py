@@ -20,7 +20,7 @@ from play import (
     PLAN_SCHEMA, PLAY_INSTRUCTIONS, VARIANT, TurnBudget, clock_seconds, fallback_rank, full_move_number,
     model_context, parse_plan, project, turn_key,
 )
-from provider import ModelUnavailable, Provider
+from provider import MIN_PLAY_REQUEST_SECONDS, ModelUnavailable, Provider
 from provider_budget import MonthlyBudgetLedger
 from review import REVIEW_INSTRUCTIONS, REVIEW_OUTPUT_SCHEMA, ReviewWorker
 
@@ -142,7 +142,7 @@ class Player:
 
             model_seconds = budget.model_until - self.now()
             ranked, rationale = [], ""
-            if model_seconds >= 5 and self.model_calls < 2:
+            if model_seconds > MIN_PLAY_REQUEST_SECONDS and self.model_calls < 2:
                 context = model_context(
                     state, attempts=candidates, beliefs=self.beliefs,
                     lessons=self.lessons, opponent=self.opponent, budget_seconds=model_seconds,
@@ -249,10 +249,9 @@ class Worker:
         self.reports = reports
         self.runners: dict[str, threading.Thread] = {}
         self.stop = threading.Event()
-        self.in_game = threading.Event()
 
     def fetch_review(self, game_id: str) -> dict | None:
-        if self.in_game.is_set() or not GAME_ID.fullmatch(game_id):
+        if self.stop.is_set() or not GAME_ID.fullmatch(game_id):
             return None
         try:
             metadata = self.api.get(f"/game/{game_id}")
@@ -266,8 +265,8 @@ class Worker:
         return review
 
     def model_review(self, context: dict) -> dict:
-        if self.in_game.is_set() or self.stop.is_set():
-            raise ModelUnavailable("live game takes priority")
+        if self.stop.is_set():
+            raise ModelUnavailable("review worker stopping")
         deadline = time.monotonic() + 65
         future = self.provider.start(
             purpose="review", game_id=context["game_code"], context=context,
@@ -282,8 +281,6 @@ class Worker:
         reviewer = ReviewWorker(self.memory, fetch_review=self.fetch_review, model_review=self.model_review)
         try:
             while not self.stop.wait(10):
-                if self.in_game.is_set():
-                    continue
                 try:
                     reviewer.run_once()
                 except (TimeoutError, RuntimeError, OSError, ValueError, requests.RequestException):
@@ -313,13 +310,10 @@ class Worker:
                 continue
             if game["game_id"] in self.runners or not GAME_ID.fullmatch(game["game_id"]):
                 continue
-            self.in_game.set()
             player = Player(game, self.api, self.memory, self.provider)
             thread = threading.Thread(target=player.run, args=(self.stop,), name=game["game_code"], daemon=True)
             self.runners[game["game_id"]] = thread
             thread.start()
-        if not self.runners:
-            self.in_game.clear()
 
     def run(self) -> None:
         self.api.post("/bots/profile", {

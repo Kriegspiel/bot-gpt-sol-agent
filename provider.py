@@ -18,6 +18,9 @@ INPUT_PRICE = 2.0
 CACHE_PRICE = 0.10
 CACHE_WRITE_PRICE = 2.50
 OUTPUT_PRICE = 10.0
+MIN_PLAY_REQUEST_SECONDS = 5.0
+MAX_PLAY_ADMISSION_SECONDS = 3.0
+MIN_REQUEST_SECONDS = 0.25
 
 
 class ModelUnavailable(RuntimeError):
@@ -70,12 +73,15 @@ class Provider:
         self.model = model
         self.ledger = ledger
         self.report_live = report_live
-        self.gates = {"play": threading.Lock(), "review": threading.Lock()}
-        self.retry_ready_at = 0.0
+        self.gates = {
+            "play": threading.BoundedSemaphore(2),
+            "review": threading.BoundedSemaphore(1),
+        }
+        self.retry_ready_at = {"play": 0.0, "review": 0.0}
 
     def availability(self) -> tuple[bool, str]:
         try:
-            if time.monotonic() < self.retry_ready_at:
+            if time.monotonic() < self.retry_ready_at["play"]:
                 return False, "openai_rate_limited"
             if not self.ledger.status().remaining_microusd:
                 return False, "openai_monthly_budget_exhausted"
@@ -90,8 +96,17 @@ class Provider:
         self, *, purpose: str, game_id: str, instructions: str, context: dict,
         schema: dict, deadline: float, effort: str, max_tokens: int,
     ) -> Future | None:
+        minimum = MIN_PLAY_REQUEST_SECONDS if purpose == "play" else MIN_REQUEST_SECONDS
+        now = time.monotonic()
+        spare = deadline - now - minimum
+        if spare <= 0 or now < self.retry_ready_at[purpose]:
+            return None
         gate = self.gates[purpose]
-        if deadline <= time.monotonic() or not gate.acquire(blocking=False):
+        if not gate.acquire(blocking=False):
+            if purpose != "play" or not gate.acquire(timeout=min(MAX_PLAY_ADMISSION_SECONDS, spare)):
+                return None
+        if deadline - time.monotonic() <= minimum:
+            gate.release()
             return None
         future: Future = Future()
 
@@ -107,7 +122,12 @@ class Provider:
             finally:
                 gate.release()
 
-        threading.Thread(target=run, name=f"provider-{purpose}", daemon=True).start()
+        try:
+            threading.Thread(target=run, name=f"provider-{purpose}", daemon=True).start()
+        except RuntimeError:
+            gate.release()
+            LOG.warning("provider worker unavailable purpose=%s", purpose)
+            return None
         return future
 
     def _request(
@@ -126,8 +146,11 @@ class Provider:
             "max_output_tokens": max_tokens,
             "text": {"format": {"type": "json_schema", "name": f"kriegspiel_{purpose}", "strict": True, "schema": schema}},
         }
-        if time.monotonic() < self.retry_ready_at:
+        now = time.monotonic()
+        if now < self.retry_ready_at[purpose]:
             raise ModelUnavailable("provider backoff")
+        if deadline - now <= MIN_REQUEST_SECONDS:
+            raise ModelUnavailable("deadline elapsed before budget reservation")
         maximum_cost = estimate_request_cost_upper_bound_usd(
             payload, input_usd_per_million_tokens=CACHE_WRITE_PRICE,
             output_usd_per_million_tokens=OUTPUT_PRICE, maximum_output_tokens=max_tokens,
@@ -139,7 +162,7 @@ class Provider:
         charged = 0.0
         try:
             seconds = deadline - time.monotonic()
-            if seconds <= 0.25:
+            if seconds <= MIN_REQUEST_SECONDS:
                 raise ModelUnavailable("deadline elapsed before provider request")
             charged = None  # A transport failure can still incur provider charges.
             response = requests.post(
@@ -147,7 +170,7 @@ class Provider:
                 timeout=(min(2.0, seconds / 3), seconds * 2 / 3), allow_redirects=False,
             )
             if response.status_code == 429:
-                self.retry_ready_at = time.monotonic() + 60
+                self.retry_ready_at[purpose] = time.monotonic() + 60
             if 400 <= response.status_code < 500:
                 charged = 0.0
             response.raise_for_status()
