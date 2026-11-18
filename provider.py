@@ -16,6 +16,7 @@ LOG = logging.getLogger(__name__)
 BASE = "https://api.openai.com/v1"
 INPUT_PRICE = 2.0
 CACHE_PRICE = 0.10
+CACHE_WRITE_PRICE = 2.50
 OUTPUT_PRICE = 10.0
 
 
@@ -47,12 +48,19 @@ def usage_record(response: dict, model: str) -> dict | None:
         return None
     inputs = usage.get("input_tokens", 0)
     outputs = usage.get("output_tokens", 0)
-    cached = min(inputs, (usage.get("input_tokens_details") or {}).get("cached_tokens", 0))
+    if not inputs and not outputs:
+        return None
+    details = usage.get("input_tokens_details") or {}
+    cached = min(inputs, details.get("cached_tokens") or 0)
+    written = min(inputs - cached, details.get("cache_write_tokens") or 0)
+    cost = (
+        (inputs - cached - written) * INPUT_PRICE + cached * CACHE_PRICE
+        + written * CACHE_WRITE_PRICE + outputs * OUTPUT_PRICE
+    ) / 1_000_000
     return {
         "provider": "openai", "model": model, "response_id": response.get("id"),
         "input_tokens": inputs, "output_tokens": outputs, "cached_input_tokens": cached,
-        "total_tokens": inputs + outputs,
-        "cost_usd": ((inputs - cached) * INPUT_PRICE + cached * CACHE_PRICE + outputs * OUTPUT_PRICE) / 1_000_000,
+        "cache_creation_input_tokens": written, "total_tokens": inputs + outputs, "cost_usd": cost,
     }
 
 
@@ -109,8 +117,11 @@ class Provider:
         payload = {
             "model": self.model,
             "store": False,
-            "instructions": instructions,
-            "input": json.dumps(context, separators=(",", ":"), ensure_ascii=True),
+            "input": [
+                {"role": "developer", "content": instructions},
+                {"role": "user", "content": json.dumps(context, separators=(",", ":"), ensure_ascii=True)},
+            ],
+            "service_tier": "default",
             "reasoning": {"effort": effort},
             "max_output_tokens": max_tokens,
             "text": {"format": {"type": "json_schema", "name": f"kriegspiel_{purpose}", "strict": True, "schema": schema}},
@@ -118,7 +129,7 @@ class Provider:
         if time.monotonic() < self.retry_ready_at:
             raise ModelUnavailable("provider backoff")
         maximum_cost = estimate_request_cost_upper_bound_usd(
-            payload, input_usd_per_million_tokens=INPUT_PRICE,
+            payload, input_usd_per_million_tokens=CACHE_WRITE_PRICE,
             output_usd_per_million_tokens=OUTPUT_PRICE, maximum_output_tokens=max_tokens,
         )
         reservation = self.ledger.reserve(maximum_cost)
@@ -150,8 +161,8 @@ class Provider:
         finally:
             self.ledger.settle(reservation, charged)
             LOG.info(
-                "usage purpose=%s game=%s cost_usd=%.6f accounting=%s input_tokens=%s output_tokens=%s",
-                purpose, game_id, charged if charged is not None else reservation.amount_microusd / 1_000_000,
+                "usage purpose=%s game=%s model=%s cost_usd=%.6f accounting=%s input_tokens=%s output_tokens=%s",
+                purpose, game_id, self.model, charged if charged is not None else reservation.amount_microusd / 1_000_000,
                 "reported" if usage else "reservation" if charged is None else "unbilled",
                 usage["input_tokens"] if usage else 0, usage["output_tokens"] if usage else 0,
             )

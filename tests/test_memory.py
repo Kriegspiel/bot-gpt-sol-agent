@@ -83,7 +83,7 @@ class MemoryTests(unittest.TestCase):
     def test_review_context_keeps_only_projected_observations(self):
         open_game(self.store, "match")
         state = {
-            "your_color": "white", "ply_count": 2, "turn": "white",
+            "your_color": "white", "ply_count": 4, "move_number": 3, "turn": "white",
             "clock": {"white_remaining": 42, "private": "discard"},
             "referee_turns": [{
                 "turn": 1,
@@ -94,7 +94,8 @@ class MemoryTests(unittest.TestCase):
         self.store.record_observation("match", state)
         self.store.record_observation("match", {**state, "clock": {"white_remaining": 25}})
         entry, = self.store.review_context("match")
-        self.assertEqual(entry["turn"], "white:2")
+        self.assertEqual(entry["turn"], "white:3")
+        self.assertEqual(entry["referee_event_index"], 4)
         self.assertEqual(entry["clock_at_start"], {"white_remaining": 42})
         turn, = entry["recent_referee_at_start"]
         self.assertEqual(turn["white"][0]["move_uci"], "e2e4")

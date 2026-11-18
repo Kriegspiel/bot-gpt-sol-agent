@@ -19,7 +19,7 @@ def response(output=None):
                 {"type": "output_text", "text": json.dumps(output or {"attempts": ["e2e4"]})}
             ]},
         ],
-        "usage": {"input_tokens": 1000, "output_tokens": 200, "input_tokens_details": {"cached_tokens": 100}},
+        "usage": {"input_tokens": 1000, "output_tokens": 200, "input_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 300}},
     }
 
 
@@ -46,8 +46,11 @@ class ProviderTests(unittest.TestCase):
                     self.assertIsNotNone(result)
                     self.assertEqual(result.result(timeout=5), {"attempts": ["e2e4"]})
                 self.assertEqual(post.call_count, 2)
-            self.assertAlmostEqual(ledger.status().spent_usd, 0.00762)
-            self.assertAlmostEqual(reports[0]["cost_usd"], 0.00381)
+                request = post.call_args.kwargs["json"]
+                self.assertEqual(request["input"][0], {"role": "developer", "content": "test"})
+                self.assertEqual(request["service_tier"], "default")
+            self.assertAlmostEqual(ledger.status().spent_usd, 0.00792)
+            self.assertAlmostEqual(reports[0]["cost_usd"], 0.00396)
             self.assertEqual(len(reports), 1)
 
 

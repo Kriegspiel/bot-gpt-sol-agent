@@ -322,7 +322,10 @@ class Worker:
             self.in_game.clear()
 
     def run(self) -> None:
-        self.api.post("/bots/profile", {"supported_rule_variants": [VARIANT], "author_note": AUTHOR_NOTE})
+        self.api.post("/bots/profile", {
+            "supported_rule_variants": [VARIANT],
+            "author_note": f"OpenAI {self.provider.model}. {AUTHOR_NOTE}",
+        })
         review_thread = threading.Thread(target=self.review_loop, name="postgame", daemon=True)
         report_thread = threading.Thread(target=self.report_loop, name="accounting", daemon=True)
         review_thread.start()
@@ -393,7 +396,7 @@ def main() -> None:
         limit_usd=float(os.getenv("OPENAI_MONTHLY_BUDGET_USD", "18")),
     )
     reports: queue.Queue = queue.Queue()
-    provider = Provider(key, os.getenv("LLM_MODEL", "gpt-6.1-sol"), ledger, reports.put_nowait)
+    provider = Provider(key, os.getenv("LLM_MODEL", "gpt-6.2-sol"), ledger, reports.put_nowait)
     memory = MemoryStore(args.state_file, use_memory=os.getenv("AGENT_USE_MEMORY", "true") == "true")
     worker = Worker(api, memory, provider, reports)
     signal.signal(signal.SIGTERM, lambda *_: worker.stop.set())
