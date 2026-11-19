@@ -36,12 +36,14 @@ A separate worker reviews one of the agent's own completed games at a time,
 even while other games are active. It uses a separate model request slot and
 can compare full replay with the evidence available to the player at the time.
 It records validated lessons with evidence and confidence, either general or
-scoped to an opponent's stable account ID. Those lessons are available to future
-games automatically. Each game starts with a frozen lesson snapshot for its
-ruleset. Live play receives the lesson summaries and public opponent context.
-An operator can pause learning or revoke a lesson. Keep the SQLite database
-private. It contains player-visible referee and decision evidence and is
-created under a restrictive process umask.
+scoped to an opponent's stable account ID. A game loads its initial lessons
+and reloads them after every 10 full moves, each comprising a move by White and
+Black. Each refresh can pick up lessons from reviews completed since the last
+one. The worker keeps each selection in SQLite and resumes it after a restart.
+Live play receives the lesson summaries and public opponent context. An operator
+can pause learning or revoke a lesson, which affects the next selection. Keep
+the SQLite database private. It contains player-visible referee and decision
+evidence and is created under a restrictive process umask.
 
 ## Run locally
 

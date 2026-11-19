@@ -33,10 +33,11 @@ DISPLAY_NAME = "GPT Sol Agent"
 DESCRIPTION = "Plays all seven supported Kriegspiel rulesets with clock-aware reasoning and lessons from completed games."
 AUTHOR_NOTE = (
     "GPT Sol Agent reasons from its own board and the referee's announcements. "
-    "It reviews its completed games and automatically retains lessons, which may include opponent tendencies. "
+    "It learns from completed games, including opponent tendencies, and refreshes its lessons after every 10 full moves. "
     "Source: https://github.com/Kriegspiel/bot-gpt-sol-agent"
 )
 GAME_ID = re.compile(r"[a-zA-Z0-9]{6,32}")
+LESSON_REFRESH_INTERVAL = 10
 
 
 class GameAPI:
@@ -116,6 +117,7 @@ class Player:
         self.current_turn = None
         self.budget = None
         self.model_calls = 0
+        self.lesson_refresh_move = 0
         self.lessons = memory.open_game(
             self.game_id, game_code=self.game_code, variant=self.variant, own_color=self.color,
             opponent_key=game.get("opponent_id"), opponent_role=opponent["role"],
@@ -138,6 +140,19 @@ class Player:
                 state, sampled_at, self.turn_started, opponent_role=self.opponent.get("role"),
             )
             self.model_calls = 0
+            completed_moves = full_move_number(state) - 1
+            checkpoint = completed_moves - completed_moves % LESSON_REFRESH_INTERVAL
+            if checkpoint > self.lesson_refresh_move:
+                try:
+                    self.lessons = self.memory.refresh_lessons(self.game_id, checkpoint)
+                except SQLiteError:
+                    LOG.warning("could not refresh lessons game=%s after_moves=%s", self.game_code, checkpoint)
+                else:
+                    self.lesson_refresh_move = checkpoint
+                    LOG.info(
+                        "loaded lesson snapshot game=%s after_moves=%s lessons=%s",
+                        self.game_code, checkpoint, len(self.lessons),
+                    )
         budget = self.budget
         journal_key = f"{self.color}:{state['move_number']}"
         rejected = self.memory.tried_actions(self.game_id, journal_key) | ongoing_rejections(state)
