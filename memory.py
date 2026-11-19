@@ -13,6 +13,7 @@ from typing import Any, Iterator
 from clock_policy import REASONING_EFFORTS, reasoning_expectations
 
 _MAX_ADVICE = 6
+_LESSON_REFRESH_TIMEOUT_SECONDS = 0.25
 _CHECK_INTERVAL = 120
 _RETRY_INTERVAL = 300
 _TIMING_HISTORY_PER_EFFORT = 20
@@ -39,6 +40,12 @@ CREATE TABLE IF NOT EXISTS games (
     last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS games_pending_review ON games(review_state, next_check);
+CREATE TABLE IF NOT EXISTS lesson_refreshes (
+    game_id TEXT NOT NULL REFERENCES games(game_id),
+    completed_moves INTEGER NOT NULL,
+    snapshot TEXT NOT NULL,
+    PRIMARY KEY (game_id, completed_moves)
+);
 CREATE TABLE IF NOT EXISTS journal (
     game_id TEXT NOT NULL REFERENCES games(game_id),
     turn_key TEXT NOT NULL,
@@ -229,7 +236,11 @@ class MemoryStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             enabled = self._learning_enabled(db) and self.use_memory
-            game = db.execute("SELECT snapshot FROM games WHERE game_id = ?", (game_id,)).fetchone()
+            game = db.execute(
+                """SELECT COALESCE((SELECT snapshot FROM lesson_refreshes WHERE game_id = games.game_id
+                                   ORDER BY completed_moves DESC LIMIT 1), snapshot) AS snapshot
+                   FROM games WHERE game_id = ?""", (game_id,),
+            ).fetchone()
             if game is None:
                 advice = self._snapshot(db, variant, opponent_key) if enabled else []
                 db.execute(
@@ -241,6 +252,26 @@ class MemoryStore:
                 )
                 return advice
             return json.loads(game["snapshot"])
+
+    def refresh_lessons(self, game_id: str, completed_moves: int) -> list[dict]:
+        """Save one selection per checkpoint and reuse it after a restart."""
+        with self._connect(timeout=_LESSON_REFRESH_TIMEOUT_SECONDS) as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                """SELECT completed_moves, snapshot FROM lesson_refreshes WHERE game_id = ?
+                   ORDER BY completed_moves DESC LIMIT 1""", (game_id,),
+            ).fetchone()
+            if previous is not None and previous["completed_moves"] >= completed_moves:
+                return json.loads(previous["snapshot"])
+            game = db.execute("SELECT variant, opponent_key FROM games WHERE game_id = ?", (game_id,)).fetchone()
+            advice = []
+            if self._learning_enabled(db) and self.use_memory:
+                advice = self._snapshot(db, game["variant"], game["opponent_key"])
+            db.execute(
+                "INSERT INTO lesson_refreshes(game_id, completed_moves, snapshot) VALUES (?, ?, ?)",
+                (game_id, completed_moves, _json(advice)),
+            )
+            return advice
 
     def record_observation(self, game_id: str, state: dict[str, Any]) -> None:
         own_color = state.get("your_color")
@@ -390,8 +421,7 @@ class MemoryStore:
 
     def rollback(self, lesson_id: int) -> bool:
         with self._connect() as db:
-            # Existing snapshots are retained as part of the record of how each
-            # game was played. New games will never pick up the revoked lesson.
+            # Saved snapshots retain the advice used between refreshes.
             return bool(db.execute(
                 "UPDATE lessons SET status = 'revoked' WHERE id = ? AND status != 'revoked'", (lesson_id,)
             ).rowcount)
@@ -402,7 +432,9 @@ class MemoryStore:
                 {**dict(row), "result": json.loads(row["result"]) if row["result"] else None}
                 for row in db.execute(
                     """SELECT game_id, game_code, variant, own_color, opponent_key, opponent_role,
-                              opponent_elo, review_state, result, last_error
+                              opponent_elo, review_state, result, last_error,
+                              COALESCE((SELECT MAX(completed_moves) FROM lesson_refreshes
+                                        WHERE game_id = games.game_id), 0) AS lesson_refresh_move
                        FROM games ORDER BY rowid DESC LIMIT ?""", (limit,)
                 )
             ]
@@ -440,8 +472,8 @@ def main() -> None:
     for verb in ("approve", "rollback"):
         command = commands.add_parser(verb)
         command.add_argument("lesson_id", type=int)
-    commands.add_parser("disable", help="Pause reviews and new-game lesson snapshots.")
-    commands.add_parser("enable", help="Resume reviews and new-game lesson snapshots.")
+    commands.add_parser("disable", help="Pause reviews and lesson retrieval at the next snapshot.")
+    commands.add_parser("enable", help="Resume reviews and lesson retrieval at the next snapshot.")
     args = parser.parse_args()
     if not args.db.is_file():
         parser.error("the bot's memory database does not exist")

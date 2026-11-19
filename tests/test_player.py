@@ -2,6 +2,7 @@ import threading
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
+from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
 
@@ -122,6 +123,46 @@ class PlayerTests(unittest.TestCase):
         self.create(provider, api).play(project(live, "white"), 100, threading.Event())
         self.assertEqual(provider.requests[0]["effort"], "xhigh")
 
+    def test_lesson_refresh_uses_completed_full_moves_for_either_side(self):
+        for color, before, after, between, next_refresh in (
+            ("white", 19, 21, 23, 41),
+            ("black", 20, 22, 24, 42),
+        ):
+            with self.subTest(color=color):
+                game = GAME if color == "white" else {**GAME, "white": GAME["black"], "black": GAME["white"]}
+                provider = FakeProvider()
+                api = FakeAPI([], [{"move_done": True}] * 4)
+                player = Player(game, api, self.memory, provider, now=lambda: 100.0)
+                first, second = [{"id": 10}], [{"id": 20}]
+                with patch.object(self.memory, "refresh_lessons", side_effect=[first, second]) as refresh:
+                    for number in (before, after, between, next_refresh):
+                        live = state(remaining=1500, ask=False, active_color=color)
+                        live.update(turn=color, your_color=color, move_number=number, ply_count=100 + number)
+                        if color == "black":
+                            live["your_fen"] = "4k3/3pp3/8/8/8/8/8/8 b - - 0 1"
+                            live["allowed_moves"] = ["d7d5"]
+                            live["clock"]["black_remaining"] = 1500
+                        player.play(project(live, color), 100, threading.Event())
+
+                self.assertEqual(refresh.call_args_list, [call(game["game_id"], 10), call(game["game_id"], 20)])
+                self.assertEqual([req["context"]["lessons"] for req in provider.requests], [[], first, first, second])
+
+    def test_lesson_refresh_retries_after_database_contention(self):
+        provider = FakeProvider()
+        api = FakeAPI([], [{"move_done": True}, {"move_done": True}])
+        player = self.create(provider, api)
+        refreshed = [{"id": 10}]
+        with patch.object(
+            self.memory, "refresh_lessons", side_effect=[OperationalError("database is locked"), refreshed],
+        ) as refresh:
+            with self.assertLogs("bot", level="WARNING"):
+                player.play(project({**state(), "move_number": 21}, "white"), 100, threading.Event())
+            player.play(project({**state(), "move_number": 23}, "white"), 100, threading.Event())
+
+        self.assertEqual(refresh.call_args_list, [call(GAME["game_id"], 10), call(GAME["game_id"], 10)])
+        self.assertEqual([req["context"]["lessons"] for req in provider.requests], [[], refreshed])
+        self.assertEqual([req[0] for req in api.calls], ["POST", "POST"])
+
     def test_accepted_fallback_move_records_turn_elapsed(self):
         live = state(remaining=4, ask=False)
         api = FakeAPI([], [{"move_done": True}])
@@ -184,8 +225,11 @@ class PlayerTests(unittest.TestCase):
         self.assertEqual(api.calls[0][0], "POST")
 
     def test_ask_any_reranks_under_same_turn_deadline(self):
-        live = state(remaining=1000)
-        after_any = {**state(remaining=990, actions=("d2e3",), ask=False), "ply_count": live["ply_count"] + 1}
+        live = {**state(remaining=1000), "move_number": 21, "ply_count": 50}
+        after_any = {
+            **state(remaining=990, actions=("d2e3",), ask=False),
+            "move_number": live["move_number"], "ply_count": live["ply_count"] + 1,
+        }
         provider = FakeProvider(
             {"attempts": ["ask_any"], "hypotheses": ["A pawn capture may be possible"], "rationale": "information"},
             {"attempts": ["d2e3"], "hypotheses": [], "rationale": "must capture"},
@@ -193,7 +237,9 @@ class PlayerTests(unittest.TestCase):
         api = FakeAPI([live, after_any, after_any], [
             {"move_done": False, "has_any": True, "announcement": "HAS_ANY"}, {"move_done": True},
         ])
-        self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        with patch.object(self.memory, "refresh_lessons", wraps=self.memory.refresh_lessons) as refresh:
+            self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        refresh.assert_called_once_with(GAME["game_id"], 10)
         self.assertEqual([call[1].rsplit("/", 1)[1] for call in api.calls if call[0] == "POST"], ["ask-any", "move"])
         self.assertEqual(provider.requests[0]["deadline"], provider.requests[1]["deadline"])
         self.assertEqual(provider.requests[1]["context"]["available_attempts"], ["d2e3"])

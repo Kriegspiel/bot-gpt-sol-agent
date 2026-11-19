@@ -1,5 +1,12 @@
 # Release notes
 
+## 1.1.0
+
+- Refresh lessons from local memory after every 10 full moves, including eligible
+  lessons from reviews that finished during the game.
+- Save each selection by checkpoint so a restarted worker resumes the same
+  advice until the next refresh.
+
 ## 1.0.0
 
 - Make validated postgame lessons available to future games automatically.

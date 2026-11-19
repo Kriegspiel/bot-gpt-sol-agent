@@ -33,7 +33,13 @@ class MemoryTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "memory.sqlite3"
         self.store = MemoryStore(self.path)
 
-    def test_automatically_approved_scoped_lessons_and_frozen_snapshots(self):
+    def publish_review(self, game_id, lessons, **game_options):
+        open_game(self.store, game_id, **game_options)
+        self.store.mark_completed(game_id)
+        game = next(item for item in self.store.pending_games() if item["game_id"] == game_id)
+        self.assertTrue(self.store.finish_review(game, lessons))
+
+    def test_automatically_approved_scoped_lessons_and_initial_snapshots(self):
         open_game(self.store, "finished")
         self.assertEqual(open_game(self.store, "before-review"), [])
         self.store.mark_completed("finished")
@@ -60,6 +66,48 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(open_game(restarted, "same"), same_opponent)
         self.assertEqual(open_game(restarted, "after-disable"), [])
         self.assertFalse(MemoryStore(self.path).is_enabled())
+
+    def test_refresh_picks_up_current_scoped_lessons_and_persists_each_checkpoint(self):
+        self.publish_review("first-review", [lesson()])
+        initial = open_game(self.store, "in-progress")
+        self.publish_review("same-opponent", [lesson("opponent")])
+        self.publish_review("other-opponent", [lesson("opponent"), lesson()], opponent="account-3")
+        self.publish_review("other-ruleset", [lesson(), lesson("opponent")], variant="wild16")
+        self.assertTrue(self.store.rollback(initial[0]["id"]))
+        self.assertEqual(open_game(self.store, "in-progress"), initial)
+
+        refreshed = self.store.refresh_lessons("in-progress", 10)
+        matching, general = refreshed
+        expected = {
+            note["id"] for note in self.store.status()["lessons"]
+            if note["game_id"] in {"same-opponent", "other-opponent"}
+            and note["opponent_key"] != "account-3"
+        }
+        self.assertEqual({note["id"] for note in refreshed}, expected)
+        self.assertEqual([matching["scope"], general["scope"]], ["opponent", "general"])
+        self.assertFalse({"game_id", "opponent_key", "evidence_plies"} & set(matching))
+
+        self.assertTrue(self.store.rollback(matching["id"]))
+        restarted = MemoryStore(self.path)
+        self.assertEqual(open_game(restarted, "in-progress"), refreshed)
+        self.assertEqual(restarted.refresh_lessons("in-progress", 10), refreshed)
+        self.assertEqual(restarted.refresh_lessons("in-progress", 20), [general])
+        tracked = next(game for game in restarted.status()["games"] if game["game_id"] == "in-progress")
+        self.assertEqual(tracked["lesson_refresh_move"], 20)
+
+    def test_refresh_respects_memory_controls_at_the_checkpoint(self):
+        self.publish_review("finished", [lesson()])
+        initial = open_game(self.store, "in-progress")
+        self.assertEqual(self.store.refresh_lessons("in-progress", 10), initial)
+
+        self.store.set_enabled(False)
+        self.assertEqual(self.store.refresh_lessons("in-progress", 20), [])
+        self.store.set_enabled(True)
+        self.assertEqual(self.store.refresh_lessons("in-progress", 20), [])
+        self.assertEqual(self.store.refresh_lessons("in-progress", 30), initial)
+
+        baseline = MemoryStore(self.path, use_memory=False)
+        self.assertEqual(baseline.refresh_lessons("in-progress", 40), [])
 
     def test_activates_legacy_candidates_only_from_successful_reviews(self):
         for game_id in ("successful", "failed", "unfinished"):
