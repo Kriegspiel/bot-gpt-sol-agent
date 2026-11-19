@@ -1,5 +1,15 @@
 # Release notes
 
+## 0.3.0
+
+- Allocate live thinking time using the clock and historical checkmate
+  horizons by public material, opponent role, and drop rules.
+- Select reasoning effort from low through max, with time for a local fallback.
+- Give live provider requests the remaining model deadline and log their
+  requested reasoning effort.
+- Journal elapsed turn time and learn which efforts fit from persisted live
+  provider latencies and timeouts.
+
 ## 0.2.0
 
 - Advertise and play all seven supported rulesets through the existing T4 account.

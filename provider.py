@@ -7,9 +7,11 @@ import logging
 import threading
 import time
 from concurrent.futures import Future
+from sqlite3 import Error as SQLiteError
 
 import requests
 
+from clock_policy import MIN_PLAY_REQUEST_SECONDS
 from provider_budget import MonthlyBudgetLedger, estimate_request_cost_upper_bound_usd
 
 LOG = logging.getLogger(__name__)
@@ -18,7 +20,6 @@ INPUT_PRICE = 2.0
 CACHE_PRICE = 0.10
 CACHE_WRITE_PRICE = 2.50
 OUTPUT_PRICE = 10.0
-MIN_PLAY_REQUEST_SECONDS = 5.0
 MAX_PLAY_ADMISSION_SECONDS = 3.0
 MIN_REQUEST_SECONDS = 0.25
 
@@ -68,11 +69,12 @@ def usage_record(response: dict, model: str) -> dict | None:
 
 
 class Provider:
-    def __init__(self, key: str, model: str, ledger: MonthlyBudgetLedger, report_live) -> None:
+    def __init__(self, key: str, model: str, ledger: MonthlyBudgetLedger, report_live, *, record_timing=None) -> None:
         self.headers = {"Authorization": f"Bearer {key}"}
         self.model = model
         self.ledger = ledger
         self.report_live = report_live
+        self.record_timing = record_timing
         self.gates = {
             "play": threading.BoundedSemaphore(2),
             "review": threading.BoundedSemaphore(1),
@@ -160,14 +162,19 @@ class Provider:
             raise ModelUnavailable("shared budget exhausted")
         usage = None
         charged = 0.0
+        started, latency = None, None
+        timed_out, valid_response = False, False
         try:
             seconds = deadline - time.monotonic()
             if seconds <= MIN_REQUEST_SECONDS:
                 raise ModelUnavailable("deadline elapsed before provider request")
             charged = None  # A transport failure can still incur provider charges.
+            connect_timeout = min(2.0, seconds / 3)
+            read_timeout = seconds - connect_timeout if purpose == "play" else seconds * 2 / 3
+            started = time.monotonic()
             response = requests.post(
                 f"{BASE}/responses", headers=self.headers, json=payload,
-                timeout=(min(2.0, seconds / 3), seconds * 2 / 3), allow_redirects=False,
+                timeout=(connect_timeout, read_timeout), allow_redirects=False,
             )
             if response.status_code == 429:
                 self.retry_ready_at[purpose] = time.monotonic() + 60
@@ -176,16 +183,28 @@ class Provider:
             response.raise_for_status()
             if response.status_code != 200:
                 raise ModelUnavailable(f"unexpected provider status {response.status_code}")
+            latency = time.monotonic() - started
             data = response.json()
             usage = usage_record(data, self.model)
             if usage is not None:
                 charged = usage["cost_usd"]
-            return response_text(data)
+            plan = response_text(data)
+            valid_response = True
+            return plan
+        except requests.Timeout:
+            if started is not None:
+                latency, timed_out = time.monotonic() - started, True
+            raise
         finally:
+            if purpose == "play" and (valid_response or timed_out) and self.record_timing is not None:
+                try:
+                    self.record_timing(self.model, effort, latency, timed_out=timed_out)
+                except (OSError, SQLiteError, ValueError):
+                    LOG.warning("could not persist provider timing model=%s effort=%s", self.model, effort)
             self.ledger.settle(reservation, charged)
             LOG.info(
-                "usage purpose=%s game=%s model=%s cost_usd=%.6f accounting=%s input_tokens=%s output_tokens=%s",
-                purpose, game_id, self.model, charged if charged is not None else reservation.amount_microusd / 1_000_000,
+                "usage purpose=%s game=%s model=%s effort=%s latency_ms=%s cost_usd=%.6f accounting=%s input_tokens=%s output_tokens=%s",
+                purpose, game_id, self.model, effort, round(latency * 1000) if latency is not None else None, charged if charged is not None else reservation.amount_microusd / 1_000_000,
                 "reported" if usage else "reservation" if charged is None else "unbilled",
                 usage["input_tokens"] if usage else 0, usage["output_tokens"] if usage else 0,
             )

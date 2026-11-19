@@ -11,16 +11,18 @@ import signal
 import threading
 import time
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
 from sqlite3 import OperationalError
 
 import requests
 
+from clock_policy import MIN_PLAY_REQUEST_SECONDS, reasoning_for
 from memory import MemoryStore
 from play import (
     PLAN_SCHEMA, TurnBudget, clock_seconds, fallback_rank, full_move_number,
     model_context, parse_plan, play_instructions, project, turn_key,
 )
-from provider import MIN_PLAY_REQUEST_SECONDS, ModelUnavailable, Provider
+from provider import ModelUnavailable, Provider
 from provider_budget import MonthlyBudgetLedger
 from review import REVIEW_INSTRUCTIONS, REVIEW_OUTPUT_SCHEMA, ReviewWorker
 from rules import SUPPORTED_VARIANTS, rules_for
@@ -132,7 +134,9 @@ class Player:
         if self.current_turn != expected:
             self.current_turn = expected
             self.turn_started = self.now()
-            self.budget = TurnBudget.start(state, sampled_at, self.turn_started)
+            self.budget = TurnBudget.start(
+                state, sampled_at, self.turn_started, opponent_role=self.opponent.get("role"),
+            )
             self.model_calls = 0
         budget = self.budget
         journal_key = f"{self.color}:{state['move_number']}"
@@ -145,7 +149,17 @@ class Player:
 
             model_seconds = budget.model_until - self.now()
             ranked, rationale = [], ""
+            reasoning = None
             if model_seconds > MIN_PLAY_REQUEST_SECONDS and self.model_calls < 2:
+                try:
+                    timings = self.memory.model_timings(self.provider.model)
+                except SQLiteError:
+                    LOG.warning("could not load provider timings game=%s", self.game_code)
+                    timings = None
+                model_seconds = budget.model_until - self.now()
+                reasoning = reasoning_for(model_seconds, timings)
+            if reasoning is not None:
+                effort, max_tokens = reasoning
                 context = model_context(
                     state, attempts=candidates, beliefs=self.beliefs,
                     lessons=self.lessons, opponent=self.opponent, budget_seconds=model_seconds,
@@ -153,8 +167,7 @@ class Player:
                 future = self.provider.start(
                     purpose="play", game_id=self.game_id, instructions=self.instructions,
                     context=context, schema=PLAN_SCHEMA, deadline=budget.model_until,
-                    effort="medium" if model_seconds >= 18 else "low",
-                    max_tokens=2048 if model_seconds >= 18 else 1024,
+                    effort=effort, max_tokens=max_tokens,
                 )
                 if future is not None:
                     self.model_calls += 1
@@ -187,6 +200,8 @@ class Player:
             rejected.add(action)
             source = "model" if ranked else "fallback"
             decision = {"source": source, "rationale": rationale if ranked else ""}
+            if ranked and reasoning is not None:
+                decision.update(reasoning_effort=reasoning[0], budget_seconds=round(model_seconds, 2))
             self.memory.record_attempt(
                 self.game_id, turn_key=journal_key, action=action, answer=None, decision=decision,
             )
@@ -200,13 +215,15 @@ class Player:
                 LOG.info("play submission uncertain game=%s", self.game_code)
                 # Resolve from the next server read. A journaled attempt isn't submitted again.
                 return
+            elapsed = self.now() - self.turn_started
+            decision["elapsed_ms"] = round(elapsed * 1000)
             self.memory.record_attempt(
                 self.game_id, turn_key=journal_key, action=action, decision=decision,
                 answer=answer,
             )
             LOG.info(
                 "attempt game=%s source=%s accepted=%s elapsed_seconds=%.3f",
-                self.game_code, source, answer.get("move_done"), self.now() - self.turn_started,
+                self.game_code, source, answer.get("move_done"), elapsed,
             )
             if answer.get("move_done") or answer.get("game_over"):
                 return
@@ -392,8 +409,11 @@ def main() -> None:
         limit_usd=float(os.getenv("OPENAI_MONTHLY_BUDGET_USD", "18")),
     )
     reports: queue.Queue = queue.Queue()
-    provider = Provider(key, os.getenv("LLM_MODEL", "gpt-6.2-sol"), ledger, reports.put_nowait)
     memory = MemoryStore(args.state_file, use_memory=os.getenv("AGENT_USE_MEMORY", "true") == "true")
+    provider = Provider(
+        key, os.getenv("LLM_MODEL", "gpt-6.2-sol"), ledger, reports.put_nowait,
+        record_timing=memory.record_model_timing,
+    )
     worker = Worker(api, memory, provider, reports)
     signal.signal(signal.SIGTERM, lambda *_: worker.stop.set())
     signal.signal(signal.SIGINT, lambda *_: worker.stop.set())

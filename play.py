@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from clock_policy import remaining_turns, reasoning_for
 from rules import SUPPORTED_VARIANTS, rules_for
 
 MOVE_ATTEMPT = re.compile(r"[a-h][1-8][a-h][1-8][qrbn]?")
@@ -12,6 +13,14 @@ DROP_ATTEMPT = re.compile(r"[PNBRQ]@[a-h][1-8]")
 SQUARE = re.compile(r"\b[a-h][1-8]\b", re.IGNORECASE)
 MATERIAL_FIELDS = ("pieces_remaining", "pawns_captured")
 RESERVE_FIELDS = ("pawns", "knights", "bishops", "rooks", "queens")
+MODEL_SUBMISSION_RESERVE_SECONDS = 4.0
+CLOCK_SAFETY_SECONDS = 0.5
+CLOCK_RESERVE_SECONDS = 120.0
+RAPID_INCREMENT_SECONDS = 10.0
+PAUSED_TURN_CAP_SECONDS = 30.0
+RUNNING_TURN_CAP_SECONDS = 90.0
+FAST_SPEND_BANK_THRESHOLD_SECONDS = 1_000.0
+FAST_SPEND_TURNS = 10
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -135,13 +144,24 @@ class TurnBudget:
     act_until: float
 
     @classmethod
-    def start(cls, state: dict, sampled_at: float, now: float) -> TurnBudget:
+    def start(
+        cls, state: dict, sampled_at: float, now: float, *, opponent_role: str | None = None,
+    ) -> TurnBudget:
         own_clock = clock_seconds(state, sampled_at, now)
-        # Increment plus part of the bank, with a cap even when the first clock is idle.
-        allotment = min(30.0, 10.0 + own_clock / 55, max(0, own_clock - 0.5))
         clock_running = state["clock"]["active_color"] == state["your_color"]
-        action_time = max(0, own_clock - 0.5) if clock_running else allotment
-        return cls(now + max(0, allotment - 4.0), now + action_time)
+        horizon = remaining_turns(state, opponent_role)
+        # Spend the top of a large bank faster. The normal allowance spreads
+        # the remaining bank over the estimated turns, with one fewer increment
+        # than turns because an increment is earned only after an accepted move.
+        fast_spend = max(0.0, own_clock - FAST_SPEND_BANK_THRESHOLD_SECONDS)
+        bank = max(0.0, own_clock - fast_spend - CLOCK_RESERVE_SECONDS - RAPID_INCREMENT_SECONDS)
+        allocation = RAPID_INCREMENT_SECONDS + bank / horizon + fast_spend / FAST_SPEND_TURNS
+        clock_limit = max(0.0, own_clock - CLOCK_SAFETY_SECONDS)
+        cap = RUNNING_TURN_CAP_SECONDS if clock_running else PAUSED_TURN_CAP_SECONDS
+        allotment = min(cap, allocation, clock_limit)
+        action_time = clock_limit if clock_running else allotment
+        model_time = max(0.0, allotment - MODEL_SUBMISSION_RESERVE_SECONDS)
+        return cls(now + model_time, now + action_time)
 
 
 def fallback_rank(state: dict, rejected: set[str]) -> list[str]:
