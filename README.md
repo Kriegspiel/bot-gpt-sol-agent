@@ -1,6 +1,7 @@
 # GPT Sol Agent
 
-`agent_gpt_sol` is a T4 Expert bot for all seven playable Kriegspiel rulesets.
+`agent_gpt_sol` is the default bot selection in the Kriegspiel lobby for
+registered players starting at T1. It plays all seven playable rulesets.
 It supports Berkeley, Berkeley + Any, Cincinnati, Wild 16, RAND, English, and
 CrazyKrieg. See the [ruleset references](rules.md). One service owns the
 identity, with a runner per assigned game and up to two concurrent live
