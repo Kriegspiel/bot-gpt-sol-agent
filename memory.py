@@ -348,7 +348,7 @@ class MemoryStore:
             db.execute("UPDATE games SET result = ? WHERE game_id = ?", (_json(result), game_id))
 
     def finish_review(self, game: dict, lessons: list[dict], *, error: str | None = None) -> bool:
-        """Publish all candidate lessons and the completion marker atomically."""
+        """Publish validated lessons and the completion marker atomically."""
         with self._connect() as db:
             changed = db.execute(
                 """UPDATE games SET review_state = 'reviewed', last_error = ?
@@ -357,10 +357,12 @@ class MemoryStore:
             ).rowcount
             if not changed:
                 return False
+            if error is not None:
+                return True
             db.executemany(
                 """INSERT INTO lessons(game_id, variant, opponent_key, phase, observation,
-                                       adjustment, confidence, evidence_plies)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                       adjustment, confidence, evidence_plies, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved')""",
                 [
                     (game["game_id"], game["variant"], game["opponent_key"] if lesson["scope"] == "opponent" else None,
                      lesson["phase"], lesson["observation"], lesson["adjustment"], lesson["confidence"],
@@ -369,6 +371,16 @@ class MemoryStore:
                 ],
             )
         return True
+
+    def activate_prior_lessons(self) -> int:
+        """Make validated lessons from the former approval queue available."""
+        with self._connect() as db:
+            return db.execute(
+                """UPDATE lessons SET status = 'approved'
+                   WHERE status = 'candidate' AND game_id IN (
+                       SELECT game_id FROM games WHERE review_state = 'reviewed' AND last_error IS NULL
+                   )"""
+            ).rowcount
 
     def approve(self, lesson_id: int) -> bool:
         with self._connect() as db:

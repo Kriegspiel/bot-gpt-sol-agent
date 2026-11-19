@@ -56,10 +56,15 @@ class ReviewTests(unittest.TestCase):
         )
         self.store.mark_completed("match")
 
-    def test_review_uses_full_replay_and_stores_only_candidate_notes(self):
+    def test_review_uses_full_replay_and_publishes_only_validated_lessons(self):
         response = complete_review()
         fetch = Mock(return_value=response)
-        model = Mock(return_value={"lessons": [candidate()]})
+        valid = candidate()
+        model = Mock(return_value={"lessons": [
+            valid,
+            {**valid, "observation": FULL_FEN, "adjustment": "Save board information for exposed positions."},
+            {**valid, "evidence_plies": [2], "adjustment": "Probe with a pawn when development is blocked."},
+        ]})
         self.store.record_attempt(
             "match", turn_key="white:0", action="d2d4", answer={"move_done": True},
             decision={"source": "model", "rationale": "Contests the center."},
@@ -75,7 +80,15 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("black perspective", str(payload))
         data = self.store.status()
         self.assertNotIn(FULL_FEN, str(data))
-        self.assertEqual(data["lessons"][0]["status"], "candidate")
+        published, = data["lessons"]
+        self.assertEqual(published["status"], "approved")
+        live_advice, = self.store.open_game(
+            "next", variant="berkeley_any", own_color="white",
+            opponent_key="stable-opponent", opponent_role="bot",
+        )
+        self.assertEqual(live_advice["id"], published["id"])
+        self.assertEqual(live_advice["adjustment"], valid["adjustment"])
+        self.assertNotIn("evidence_plies", live_advice)
         self.assertEqual(data["games"][0]["result"]["accepted_moves"], 1)
         self.assertEqual(data["games"][0]["result"]["model_attempts"], 1)
         self.assertFalse(worker.run_once())

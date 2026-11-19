@@ -3,7 +3,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
 import requests
 
@@ -220,6 +220,23 @@ class PlayerTests(unittest.TestCase):
         live = state(remaining=1500, active_color=None)
         budget = TurnBudget.start(project(live, "white"), 98, 100)
         self.assertEqual((budget.model_until, budget.act_until), (126, 130))
+
+    def test_worker_activates_prior_lessons_before_discovering_games(self):
+        provider = Mock(model="gpt-6.2-sol")
+        provider.availability.return_value = (True, "ready")
+        worker = Worker(Mock(), self.memory, provider, None)
+        calls = Mock()
+
+        with (
+            patch.object(self.memory, "activate_prior_lessons", return_value=1) as activate,
+            patch.object(worker, "discover", side_effect=worker.stop.set) as discover,
+            patch("bot.threading.Thread"),
+        ):
+            calls.attach_mock(activate, "activate_prior_lessons")
+            calls.attach_mock(discover, "discover")
+            worker.run()
+
+        self.assertEqual(calls.mock_calls, [call.activate_prior_lessons(), call.discover()])
 
     def test_review_fetch_requires_completed_owned_metadata(self):
         active = {**GAME, "state": "active"}

@@ -35,11 +35,13 @@ requirements after the first observations with `python -m memory --db PATH statu
 A separate worker reviews one of the agent's own completed games at a time,
 even while other games are active. It uses a separate model request slot and
 can compare full replay with the evidence available to the player at the time.
-It proposes bounded lessons with evidence and confidence, either general or
-scoped to an opponent's stable account ID. A game uses a frozen set of approved
-lessons for its ruleset. The live provider prompt receives approved summaries and public
-opponent context. Keep the SQLite database private. It contains player-visible
-referee and decision evidence and is created under a restrictive process umask.
+It records validated lessons with evidence and confidence, either general or
+scoped to an opponent's stable account ID. Those lessons are available to future
+games automatically. Each game starts with a frozen lesson snapshot for its
+ruleset. Live play receives the lesson summaries and public opponent context.
+An operator can pause learning or revoke a lesson. Keep the SQLite database
+private. It contains player-visible referee and decision evidence and is
+created under a restrictive process umask.
 
 ## Run locally
 
