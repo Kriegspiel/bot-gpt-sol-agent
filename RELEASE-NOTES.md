@@ -1,5 +1,13 @@
 # Release notes
 
+## 1.2.0
+
+- Index approved strategy lessons with OpenAI embeddings and backfill existing notes.
+- Rank scoped lessons by relevance to player-visible evidence on the first turn
+  and at each 10-move checkpoint. Preserve local ranking for tight clocks or
+  unavailable embeddings.
+- Track embedding usage and cost separately against the shared OpenAI budget.
+
 ## 1.1.0
 
 - Refresh lessons from local memory after every 10 full moves, including eligible

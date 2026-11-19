@@ -126,6 +126,43 @@ def full_move_number(state: dict) -> int:
     return (state["move_number"] + 1) // 2
 
 
+def lesson_query(state: dict) -> str:
+    """Describe tactical cues from the live player projection for semantic search."""
+    side = state["your_color"]
+    opponent = "black" if side == "white" else "white"
+    own_board = state["your_fen"].split()[0].lower()
+    own_pieces = sum(own_board.count(piece) for piece in "pnbrqk")
+    opponent_pieces = state["material_summary"][opponent].get("pieces_remaining")
+    if isinstance(opponent_pieces, int) and own_pieces + opponent_pieces <= 12:
+        phase = "endgame"
+    else:
+        phase = "opening" if full_move_number(state) <= 10 else "middlegame"
+    pieces = ", ".join(
+        f"{own_board.count(piece)} {name}"
+        for piece, name in zip("pnbrqk", ("pawn", "knight", "bishop", "rook", "queen", "king"), strict=True)
+        if piece in own_board
+    )
+    cues = [f"Kriegspiel {phase}. Own material: {pieces}."]
+    if isinstance(opponent_pieces, int):
+        cues.append(f"Opponent publicly has {opponent_pieces} pieces remaining.")
+    if "ask_any" in state["possible_actions"]:
+        cues.append("Can ask the referee whether a pawn capture is available.")
+    if state.get("reserve_summary"):
+        for color, reserves in state["reserve_summary"].items():
+            available = ", ".join(f"{count} {piece}" for piece, count in reserves.items() if count)
+            if available:
+                owner = "Own" if color == side else "Opponent"
+                cues.append(f"{owner} reserve pieces for drops: {available}.")
+    referee = [
+        f"{'Own' if color == side else 'Opponent'} turn: {message[:160]}"
+        for turn in state["referee_turns"][-3:]
+        for color in ("white", "black")
+        for entry in turn[color]
+        if isinstance(message := entry.get("message"), str) and message
+    ]
+    return "\n".join(cues + referee[-8:])
+
+
 def turn_key(state: dict) -> tuple[str, int]:
     # The API ply_count also advances on rejected attempts and Ask Any.
     return state["turn"], state["move_number"]

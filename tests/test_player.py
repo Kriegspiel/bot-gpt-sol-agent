@@ -11,6 +11,7 @@ import requests
 from bot import Player, Worker
 from memory import MemoryStore
 from play import TurnBudget, project
+from provider import EMBEDDING_DIMENSIONS
 from rules import rules_for
 
 
@@ -47,6 +48,8 @@ class FakeProvider:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests = []
+        self.embedding_requests = []
+        self.embedding_responses = []
 
     def start(self, **kwargs):
         self.requests.append(kwargs)
@@ -54,6 +57,10 @@ class FakeProvider:
         if isinstance(value, Future):
             return value
         return completed_future(value) if value is not None else None
+
+    def start_embedding(self, **kwargs):
+        self.embedding_requests.append(kwargs)
+        return self.embedding_responses.pop(0)
 
 
 class FakeAPI:
@@ -83,6 +90,21 @@ class PlayerTests(unittest.TestCase):
     def create(self, provider, api):
         return Player(GAME, api, self.memory, provider, now=lambda: 100.0)
 
+    def publish_lesson(self):
+        self.memory.open_game(
+            "finished", variant=GAME["rule_variant"], own_color="white",
+            opponent_key=GAME["opponent_id"], opponent_role="user",
+        )
+        self.memory.mark_completed("finished")
+        game, = self.memory.pending_games()
+        lesson = {
+            "scope": "opponent", "phase": "endgame", "confidence": "medium", "evidence_plies": [1],
+            "observation": "A revealed diagonal check constrained the king's options.",
+            "adjustment": "Test a defense that covers both possible checking rays.",
+        }
+        self.assertTrue(self.memory.finish_review(game, [lesson]))
+        return self.memory.status()["lessons"][0]["id"]
+
     def test_live_requires_active_side_and_rejects_a_full_board(self):
         live = state()
         safe = project(live, "white")
@@ -102,8 +124,11 @@ class PlayerTests(unittest.TestCase):
         live = state(remaining=3)
         api = FakeAPI([], [{"move_done": True}])
         provider = FakeProvider()
-        self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        with patch.object(self.memory, "has_indexed_lessons", return_value=True) as indexed:
+            self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        indexed.assert_not_called()
         self.assertEqual(provider.requests, [])
+        self.assertEqual(provider.embedding_requests, [])
         self.assertEqual(len(api.calls), 1)
         self.assertIn(api.calls[0][2]["uci"], live["allowed_moves"])
 
@@ -134,7 +159,7 @@ class PlayerTests(unittest.TestCase):
                 api = FakeAPI([], [{"move_done": True}] * 4)
                 player = Player(game, api, self.memory, provider, now=lambda: 100.0)
                 first, second = [{"id": 10}], [{"id": 20}]
-                with patch.object(self.memory, "refresh_lessons", side_effect=[first, second]) as refresh:
+                with patch.object(self.memory, "refresh_lessons", side_effect=[[], first, second]) as refresh:
                     for number in (before, after, between, next_refresh):
                         live = state(remaining=1500, ask=False, active_color=color)
                         live.update(turn=color, your_color=color, move_number=number, ply_count=100 + number)
@@ -144,7 +169,9 @@ class PlayerTests(unittest.TestCase):
                             live["clock"]["black_remaining"] = 1500
                         player.play(project(live, color), 100, threading.Event())
 
-                self.assertEqual(refresh.call_args_list, [call(game["game_id"], 10), call(game["game_id"], 20)])
+                self.assertEqual(refresh.call_args_list, [
+                    call(game["game_id"], checkpoint, query_vector=None) for checkpoint in (0, 10, 20)
+                ])
                 self.assertEqual([req["context"]["lessons"] for req in provider.requests], [[], first, first, second])
 
     def test_lesson_refresh_retries_after_database_contention(self):
@@ -159,9 +186,68 @@ class PlayerTests(unittest.TestCase):
                 player.play(project({**state(), "move_number": 21}, "white"), 100, threading.Event())
             player.play(project({**state(), "move_number": 23}, "white"), 100, threading.Event())
 
-        self.assertEqual(refresh.call_args_list, [call(GAME["game_id"], 10), call(GAME["game_id"], 10)])
+        self.assertEqual(refresh.call_args_list, [call(GAME["game_id"], 10, query_vector=None)] * 2)
         self.assertEqual([req["context"]["lessons"] for req in provider.requests], [[], refreshed])
         self.assertEqual([req[0] for req in api.calls], ["POST", "POST"])
+
+    def test_search_uses_visible_cues_and_reuses_checkpoint_after_restart(self):
+        note_id = self.publish_lesson()
+        vector = [1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))]
+        self.memory.save_lesson_embeddings([(note_id, vector)])
+        provider = FakeProvider()
+        provider.embedding_responses = [completed_future([vector])]
+        api = FakeAPI([], [{"move_done": True}, {"move_done": True}])
+        live = state(remaining=1500)
+        live["full_fen"] = "hidden board"
+        live["referee_turns"][0]["black"][0]["message"] = "Check on the long diagonal"
+        self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+
+        self.assertTrue(self.memory.rollback(note_id))
+        next_turn = {**live, "move_number": 5, "ply_count": 8}
+        self.create(provider, api).play(project(next_turn, "white"), 100, threading.Event())
+
+        request, = provider.embedding_requests
+        self.assertEqual(request["purpose"], "lesson_search")
+        self.assertEqual(request["deadline"], 101.5)
+        query, = request["inputs"]
+        self.assertIn("endgame", query)
+        self.assertIn("Check on the long diagonal", query)
+        for private in ("e7e6", "hidden board", GAME["opponent_id"], GAME["black"]["username"]):
+            self.assertNotIn(private, query)
+        self.assertEqual([req["context"]["lessons"][0]["id"] for req in provider.requests], [note_id, note_id])
+
+    def test_embedding_timeout_uses_local_lesson_ranking(self):
+        note_id = self.publish_lesson()
+        self.memory.save_lesson_embeddings([(note_id, [1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))])])
+        provider = FakeProvider()
+        expired = Future()
+        expired.set_exception(TimeoutError())
+        provider.embedding_responses = [expired]
+        live = project(state(remaining=1500), "white")
+        api = FakeAPI([], [{"move_done": True}])
+
+        self.create(provider, api).play(live, 100, threading.Event())
+
+        self.assertEqual(len(provider.embedding_requests), 1)
+        self.assertEqual(provider.requests[0]["context"]["lessons"][0]["id"], note_id)
+
+    def test_indexer_batches_lesson_text_and_reuses_saved_embedding(self):
+        note_id = self.publish_lesson()
+        provider = FakeProvider()
+        provider.embedding_responses = [completed_future([[1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))]])]
+        worker = Worker(Mock(), self.memory, provider, None)
+
+        worker.index_lessons()
+        worker.index_lessons()
+
+        request, = provider.embedding_requests
+        self.assertEqual(request["purpose"], "lesson_index")
+        text, = request["inputs"]
+        self.assertIn("diagonal check", text)
+        self.assertIn("checking rays", text)
+        self.assertNotIn(GAME["opponent_id"], text)
+        self.assertEqual(self.memory.unindexed_lessons(), [])
+        self.assertEqual(self.memory.status()["lessons"][0]["id"], note_id)
 
     def test_accepted_fallback_move_records_turn_elapsed(self):
         live = state(remaining=4, ask=False)
@@ -239,7 +325,7 @@ class PlayerTests(unittest.TestCase):
         ])
         with patch.object(self.memory, "refresh_lessons", wraps=self.memory.refresh_lessons) as refresh:
             self.create(provider, api).play(project(live, "white"), 100, threading.Event())
-        refresh.assert_called_once_with(GAME["game_id"], 10)
+        refresh.assert_called_once_with(GAME["game_id"], 10, query_vector=None)
         self.assertEqual([call[1].rsplit("/", 1)[1] for call in api.calls if call[0] == "POST"], ["ask-any", "move"])
         self.assertEqual(provider.requests[0]["deadline"], provider.requests[1]["deadline"])
         self.assertEqual(provider.requests[1]["context"]["available_attempts"], ["d2e3"])

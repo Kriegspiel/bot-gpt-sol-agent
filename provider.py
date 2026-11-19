@@ -1,11 +1,13 @@
-"""Bounded OpenAI Responses requests and shared provider accounting."""
+"""Bounded OpenAI requests and shared provider accounting."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future
 from sqlite3 import Error as SQLiteError
 
@@ -20,6 +22,9 @@ INPUT_PRICE = 2.0
 CACHE_PRICE = 0.10
 CACHE_WRITE_PRICE = 2.50
 OUTPUT_PRICE = 10.0
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIMENSIONS = 256
+EMBEDDING_INPUT_PRICE = 0.02
 MAX_PLAY_ADMISSION_SECONDS = 3.0
 MIN_REQUEST_SECONDS = 0.25
 
@@ -68,6 +73,31 @@ def usage_record(response: dict, model: str) -> dict | None:
     }
 
 
+def _embedding_vectors(response: dict, count: int) -> list[list[float]]:
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, list) or len(data) != count:
+        raise ValueError("unexpected number of embeddings")
+    vectors = {}
+    for row in data:
+        if not isinstance(row, dict):
+            raise ValueError("invalid embedding row")
+        index, values = row.get("index"), row.get("embedding")
+        if type(index) is not int or not 0 <= index < count or index in vectors:
+            raise ValueError("invalid embedding index")
+        if not isinstance(values, list) or len(values) != EMBEDDING_DIMENSIONS:
+            raise ValueError("invalid embedding dimensions")
+        if any(type(value) not in (int, float) for value in values):
+            raise ValueError("invalid embedding coordinates")
+        try:
+            norm = math.hypot(*values)
+        except OverflowError as exc:
+            raise ValueError("invalid embedding magnitude") from exc
+        if not norm or not math.isfinite(norm):
+            raise ValueError("invalid embedding magnitude")
+        vectors[index] = [value / norm for value in values]
+    return [vectors[index] for index in range(count)]
+
+
 class Provider:
     def __init__(self, key: str, model: str, ledger: MonthlyBudgetLedger, report_live, *, record_timing=None) -> None:
         self.headers = {"Authorization": f"Bearer {key}"}
@@ -78,8 +108,10 @@ class Provider:
         self.gates = {
             "play": threading.BoundedSemaphore(2),
             "review": threading.BoundedSemaphore(1),
+            "lesson_index": threading.BoundedSemaphore(1),
+            "lesson_search": threading.BoundedSemaphore(1),
         }
-        self.retry_ready_at = {"play": 0.0, "review": 0.0}
+        self.retry_ready_at = dict.fromkeys(self.gates, 0.0)
 
     def availability(self) -> tuple[bool, str]:
         try:
@@ -98,6 +130,35 @@ class Provider:
         self, *, purpose: str, game_id: str, instructions: str, context: dict,
         schema: dict, deadline: float, effort: str, max_tokens: int,
     ) -> Future | None:
+        return self._start_request(
+            purpose=purpose, deadline=deadline,
+            request=lambda: self._request(
+                purpose=purpose, game_id=game_id, instructions=instructions, context=context,
+                schema=schema, deadline=deadline, effort=effort, max_tokens=max_tokens,
+            ),
+        )
+
+    def start_embedding(
+        self, *, inputs: list[str], deadline: float, purpose: str, game_id: str,
+    ) -> Future | None:
+        if purpose not in ("lesson_index", "lesson_search"):
+            raise ValueError("unknown embedding purpose")
+        if not inputs or any(not isinstance(value, str) or not value.strip() for value in inputs):
+            raise ValueError("embeddings require non-empty text")
+        payload = {
+            "model": EMBEDDING_MODEL, "input": list(inputs),
+            "dimensions": EMBEDDING_DIMENSIONS, "encoding_format": "float",
+        }
+        return self._start_request(
+            purpose=purpose, deadline=deadline,
+            request=lambda: self._request_embedding(
+                purpose=purpose, game_id=game_id, payload=payload, deadline=deadline,
+            ),
+        )
+
+    def _start_request(
+        self, *, purpose: str, deadline: float, request: Callable[[], dict | list[list[float]]],
+    ) -> Future | None:
         minimum = MIN_PLAY_REQUEST_SECONDS if purpose == "play" else MIN_REQUEST_SECONDS
         now = time.monotonic()
         spare = deadline - now - minimum
@@ -114,11 +175,8 @@ class Provider:
 
         def run():
             try:
-                result = self._request(
-                    purpose=purpose, game_id=game_id, instructions=instructions, context=context,
-                    schema=schema, deadline=deadline, effort=effort, max_tokens=max_tokens,
-                )
-                future.set_result(result)
+                if future.set_running_or_notify_cancel():
+                    future.set_result(request())
             except Exception as exc:
                 future.set_exception(exc)
             finally:
@@ -210,3 +268,57 @@ class Provider:
             )
             if purpose == "play" and usage is not None:
                 self.report_live({"game_id": game_id, **usage})
+
+    def _request_embedding(
+        self, *, purpose: str, game_id: str, payload: dict, deadline: float,
+    ) -> list[list[float]]:
+        now = time.monotonic()
+        if now < self.retry_ready_at[purpose]:
+            raise ModelUnavailable("provider backoff")
+        if deadline - now <= MIN_REQUEST_SECONDS:
+            raise ModelUnavailable("deadline elapsed before budget reservation")
+        maximum_cost = estimate_request_cost_upper_bound_usd(
+            payload, input_usd_per_million_tokens=EMBEDDING_INPUT_PRICE,
+            output_usd_per_million_tokens=0.0, maximum_output_tokens=0,
+        )
+        reservation = self.ledger.reserve(maximum_cost)
+        if reservation is None:
+            raise ModelUnavailable("shared budget exhausted")
+
+        inputs = None
+        charged = 0.0
+        started = None
+        try:
+            seconds = deadline - time.monotonic()
+            if seconds <= MIN_REQUEST_SECONDS:
+                raise ModelUnavailable("deadline elapsed before provider request")
+            charged = None
+            connect_timeout = min(2.0, seconds / 3)
+            started = time.monotonic()
+            response = requests.post(
+                f"{BASE}/embeddings", headers=self.headers, json=payload,
+                timeout=(connect_timeout, seconds - connect_timeout), allow_redirects=False,
+            )
+            if response.status_code == 429:
+                self.retry_ready_at[purpose] = time.monotonic() + 60
+            if 400 <= response.status_code < 500:
+                charged = 0.0
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise ModelUnavailable(f"unexpected provider status {response.status_code}")
+            data = response.json()
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if isinstance(usage, dict) and type(usage.get("prompt_tokens")) is int and usage["prompt_tokens"] >= 0:
+                inputs = usage["prompt_tokens"]
+                charged = inputs * EMBEDDING_INPUT_PRICE / 1_000_000
+            return _embedding_vectors(data, len(payload["input"]))
+        finally:
+            latency_ms = round((time.monotonic() - started) * 1000) if started is not None else None
+            self.ledger.settle(reservation, charged)
+            LOG.info(
+                "usage purpose=%s game=%s model=%s latency_ms=%s cost_usd=%.8f accounting=%s input_tokens=%s output_tokens=0",
+                purpose, game_id, EMBEDDING_MODEL, latency_ms,
+                charged if charged is not None else reservation.amount_microusd / 1_000_000,
+                "reported" if inputs is not None else "reservation" if charged is None else "unbilled",
+                inputs if inputs is not None else 0,
+            )
