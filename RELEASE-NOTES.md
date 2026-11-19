@@ -1,5 +1,11 @@
 # Release notes
 
+## 1.0.0
+
+- Make validated postgame lessons available to future games automatically.
+- Activate previously queued lessons from successful reviews at startup.
+- Preserve pause, rollback, and the lesson snapshots of games already underway.
+
 ## 0.3.0
 
 - Allocate live thinking time using the clock and historical checkmate

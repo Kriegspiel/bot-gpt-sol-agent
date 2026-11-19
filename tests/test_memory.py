@@ -1,3 +1,5 @@
+from contextlib import closing
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,17 +33,16 @@ class MemoryTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "memory.sqlite3"
         self.store = MemoryStore(self.path)
 
-    def test_approved_scoped_lessons_and_frozen_snapshots(self):
+    def test_automatically_approved_scoped_lessons_and_frozen_snapshots(self):
         open_game(self.store, "finished")
+        self.assertEqual(open_game(self.store, "before-review"), [])
         self.store.mark_completed("finished")
         finished = self.store.pending_games()[0]
         self.assertTrue(self.store.finish_review(finished, [lesson(), lesson("opponent")]))
         self.assertFalse(self.store.finish_review(finished, [lesson()]))
-        self.assertEqual(open_game(self.store, "before-approval"), [])
 
-        lessons = self.store.status()["lessons"]
-        for note in lessons:
-            self.assertTrue(self.store.approve(note["id"]))
+        self.assertEqual([note["status"] for note in self.store.status()["lessons"]], ["approved", "approved"])
+
         same_opponent = open_game(self.store, "same")
         self.assertEqual([note["scope"] for note in same_opponent], ["opponent", "general"])
         self.assertEqual(len(open_game(self.store, "different", opponent="account-3")), 1)
@@ -49,7 +50,7 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse({"game_id", "opponent_key", "evidence_plies"} & set(same_opponent[0]))
 
         restarted = MemoryStore(self.path)
-        self.assertEqual(open_game(restarted, "before-approval"), [])
+        self.assertEqual(open_game(restarted, "before-review"), [])
         self.assertEqual(open_game(restarted, "same"), same_opponent)
         self.assertTrue(restarted.rollback(same_opponent[0]["id"]))
         self.assertEqual(open_game(restarted, "same"), same_opponent)
@@ -59,6 +60,40 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(open_game(restarted, "same"), same_opponent)
         self.assertEqual(open_game(restarted, "after-disable"), [])
         self.assertFalse(MemoryStore(self.path).is_enabled())
+
+    def test_activates_legacy_candidates_only_from_successful_reviews(self):
+        for game_id in ("successful", "failed", "unfinished"):
+            open_game(self.store, game_id)
+            self.store.mark_completed(game_id)
+        pending = {game["game_id"]: game for game in self.store.pending_games()}
+        self.assertTrue(self.store.finish_review(pending["successful"], []))
+        self.assertTrue(self.store.finish_review(pending["failed"], [lesson()], error="invalid_model_output"))
+        self.assertEqual(self.store.status()["lessons"], [])
+
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.executemany(
+                """INSERT INTO lessons(id, game_id, variant, phase, observation, adjustment, confidence,
+                                       evidence_plies, status)
+                   VALUES (?, ?, 'berkeley_any', 'opening', 'Center control allowed development.',
+                           'Develop pieces while protecting the center.', 'medium', '[1]', ?)""",
+                [
+                    (1, "successful", "candidate"),
+                    (2, "failed", "candidate"),
+                    (3, "unfinished", "candidate"),
+                    (4, "successful", "approved"),
+                    (5, "successful", "revoked"),
+                ],
+            )
+
+        existing_snapshot = open_game(self.store, "already-playing")
+        self.assertEqual([note["id"] for note in existing_snapshot], [4])
+        self.assertEqual(self.store.activate_prior_lessons(), 1)
+        self.assertEqual(self.store.activate_prior_lessons(), 0)
+
+        statuses = {note["id"]: note["status"] for note in self.store.status()["lessons"]}
+        self.assertEqual(statuses, {1: "approved", 2: "candidate", 3: "candidate", 4: "approved", 5: "revoked"})
+        self.assertEqual(open_game(self.store, "already-playing"), existing_snapshot)
+        self.assertEqual({note["id"] for note in open_game(self.store, "new-game")}, {1, 4})
 
     def test_intent_is_durable_and_enriched_by_result(self):
         open_game(self.store, "first", code="SAME23")

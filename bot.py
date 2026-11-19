@@ -33,7 +33,7 @@ DISPLAY_NAME = "GPT Sol Agent"
 DESCRIPTION = "Plays all seven supported Kriegspiel rulesets with clock-aware reasoning and lessons from completed games."
 AUTHOR_NOTE = (
     "GPT Sol Agent reasons from its own board and the referee's announcements. "
-    "It reviews its completed games and retains approved lessons, which may include opponent tendencies. "
+    "It reviews its completed games and automatically retains lessons, which may include opponent tendencies. "
     "Source: https://github.com/Kriegspiel/bot-gpt-sol-agent"
 )
 GAME_ID = re.compile(r"[a-zA-Z0-9]{6,32}")
@@ -339,6 +339,9 @@ class Worker:
             "supported_rule_variants": list(SUPPORTED_VARIANTS),
             "author_note": f"OpenAI {self.provider.model}. {AUTHOR_NOTE}",
         })
+        activated = self.memory.activate_prior_lessons()
+        if activated:
+            LOG.info("activated lessons from prior reviews count=%s", activated)
         review_thread = threading.Thread(target=self.review_loop, name="postgame", daemon=True)
         report_thread = threading.Thread(target=self.report_loop, name="accounting", daemon=True)
         review_thread.start()
