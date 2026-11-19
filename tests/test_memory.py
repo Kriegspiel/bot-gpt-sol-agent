@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memory import MemoryStore
+from provider import EMBEDDING_DIMENSIONS
 
 
 def open_game(store, game_id, *, code=None, opponent="account-2", variant="berkeley_any"):
@@ -24,6 +25,12 @@ def lesson(scope="general"):
         "confidence": "medium",
         "evidence_plies": [1, 3],
     }
+
+
+def embedding(axis):
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    vector[axis] = 1.0
+    return vector
 
 
 class MemoryTests(unittest.TestCase):
@@ -108,6 +115,78 @@ class MemoryTests(unittest.TestCase):
 
         baseline = MemoryStore(self.path, use_memory=False)
         self.assertEqual(baseline.refresh_lessons("in-progress", 40), [])
+
+    def test_semantic_selection_ranks_relevance_within_scope_and_persists_checkpoint_zero(self):
+        for key, scope, confidence in (
+            ("old-relevant", "general", "low"),
+            ("high-relevant", "general", "high"),
+            ("new-high-relevant", "general", "high"),
+            ("unrelated", "general", "high"),
+            ("unindexed", "general", "high"),
+            ("new-unrelated", "general", "high"),
+            ("opponent-relevant", "opponent", "low"),
+            ("opponent-unrelated", "opponent", "high"),
+        ):
+            self.publish_review(key, [{**lesson(scope), "confidence": confidence}])
+        self.publish_review("wrong-variant", [lesson()], variant="wild16")
+        self.publish_review("wrong-opponent", [lesson("opponent")], opponent="account-3")
+        status = self.store.status()
+        ids = {note["game_id"]: note["id"] for note in status["lessons"]}
+        self.store.save_lesson_embeddings([
+            (lesson_id, embedding(int("unrelated" in key)))
+            for key, lesson_id in ids.items() if key != "unindexed"
+        ])
+
+        initial = open_game(self.store, "in-progress")
+        self.assertNotIn(ids["old-relevant"], {note["id"] for note in initial})
+        self.assertTrue(self.store.has_indexed_lessons("in-progress"))
+        self.assertIsNone(self.store.saved_lesson_selection("in-progress", 0))
+        selected = self.store.refresh_lessons("in-progress", 0, query_vector=embedding(0))
+        self.assertEqual([note["id"] for note in selected], [
+            ids[key] for key in (
+                "opponent-relevant", "opponent-unrelated", "new-high-relevant", "high-relevant",
+                "old-relevant", "new-unrelated",
+            )
+        ])
+        self.assertEqual(set(selected[0]), {"id", "scope", "phase", "observation", "adjustment", "confidence"})
+
+        reopened = MemoryStore(self.path)
+        self.assertEqual(open_game(reopened, "in-progress"), selected)
+        self.assertEqual(reopened.saved_lesson_selection("in-progress", 0), selected)
+        self.assertIsNone(reopened.saved_lesson_selection("in-progress", 10))
+        self.assertTrue(reopened.rollback(ids["opponent-relevant"]))
+        self.assertEqual(reopened.refresh_lessons("in-progress", 0, query_vector=embedding(1)), selected)
+        refreshed = reopened.refresh_lessons("in-progress", 10, query_vector=embedding(1))
+        self.assertNotIn(ids["opponent-relevant"], {note["id"] for note in refreshed})
+        self.assertEqual(reopened.saved_lesson_selection("in-progress", 10), refreshed)
+
+    def test_embedding_backfill_is_idempotent_and_filters_disabled_or_ineligible_lessons(self):
+        self.publish_review("prior-review", [lesson("opponent"), lesson("opponent")])
+        first, second = self.store.unindexed_lessons()
+        self.assertEqual(set(first), {"id", "phase", "observation", "adjustment"})
+        self.assertEqual(self.store.unindexed_lessons(limit=1), [first])
+        self.assertTrue(self.store.rollback(second["id"]))
+
+        with patch("memory.EMBEDDING_MODEL", "old-embedding-model"):
+            self.store.save_lesson_embeddings([(first["id"], embedding(0))])
+        open_game(self.store, "eligible")
+        self.assertFalse(self.store.has_indexed_lessons("eligible"))
+        self.assertEqual(self.store.unindexed_lessons(), [first])
+        self.store.save_lesson_embeddings([(first["id"], embedding(0)), (second["id"], embedding(1))])
+        self.store.save_lesson_embeddings([(first["id"], embedding(0))])
+        self.assertEqual(self.store.status()["indexed_lesson_count"], 1)
+        self.assertEqual(self.store.unindexed_lessons(), [])
+        self.assertTrue(self.store.has_indexed_lessons("eligible"))
+
+        open_game(self.store, "other-opponent", opponent="account-3")
+        open_game(self.store, "other-variant", variant="wild16")
+        self.assertFalse(self.store.has_indexed_lessons("other-opponent"))
+        self.assertFalse(self.store.has_indexed_lessons("other-variant"))
+        self.assertFalse(MemoryStore(self.path, use_memory=False).has_indexed_lessons("eligible"))
+        self.publish_review("later-review", [lesson()])
+        self.store.set_enabled(False)
+        self.assertEqual(self.store.unindexed_lessons(), [])
+        self.assertFalse(self.store.has_indexed_lessons("eligible"))
 
     def test_activates_legacy_candidates_only_from_successful_reviews(self):
         for game_id in ("successful", "failed", "unfinished"):

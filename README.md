@@ -36,14 +36,23 @@ A separate worker reviews one of the agent's own completed games at a time,
 even while other games are active. It uses a separate model request slot and
 can compare full replay with the evidence available to the player at the time.
 It records validated lessons with evidence and confidence, either general or
-scoped to an opponent's stable account ID. A game loads its initial lessons
-and reloads them after every 10 full moves, each comprising a move by White and
-Black. Each refresh can pick up lessons from reviews completed since the last
-one. The worker keeps each selection in SQLite and resumes it after a restart.
-Live play receives the lesson summaries and public opponent context. An operator
-can pause learning or revoke a lesson, which affects the next selection. Keep
-the SQLite database private. It contains player-visible referee and decision
-evidence and is created under a restrictive process umask.
+scoped to an opponent's stable account ID. The worker batches approved lesson
+text for embedding with `text-embedding-3-small` and saves each vector in
+SQLite. This also indexes lessons already in memory.
+
+On the first turn and after every 10 full moves, a query summarizes own
+material, public counts, and recent referee announcements. The worker ranks
+matching ruleset and opponent lessons by semantic similarity, then confidence
+and recency, with up to four general lessons and two about the current
+opponent. Local confidence and recency ranking is available when search lacks
+an embedding or time. Live search allows up to 1.5 seconds for the embedding
+request while leaving time for reasoning and submission. Embeddings use the
+same shared OpenAI ledger as play and review.
+
+The worker saves each selection in SQLite and resumes it after a restart.
+An operator can pause learning or revoke a lesson, which affects the next
+selection. Keep the SQLite database private. It contains player-visible
+referee and decision evidence and is created under a restrictive process umask.
 
 ## Run locally
 

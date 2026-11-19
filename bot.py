@@ -19,7 +19,7 @@ import requests
 from clock_policy import MIN_PLAY_REQUEST_SECONDS, reasoning_for
 from memory import MemoryStore
 from play import (
-    PLAN_SCHEMA, TurnBudget, clock_seconds, fallback_rank, full_move_number,
+    PLAN_SCHEMA, TurnBudget, clock_seconds, fallback_rank, full_move_number, lesson_query,
     model_context, parse_plan, play_instructions, project, turn_key,
 )
 from provider import ModelUnavailable, Provider
@@ -33,11 +33,13 @@ DISPLAY_NAME = "GPT Sol Agent"
 DESCRIPTION = "Plays all seven supported Kriegspiel rulesets with clock-aware reasoning and lessons from completed games."
 AUTHOR_NOTE = (
     "GPT Sol Agent reasons from its own board and the referee's announcements. "
-    "It learns from completed games, including opponent tendencies, and refreshes its lessons after every 10 full moves. "
+    "It learns from completed games and searches for relevant lessons at the start and after every 10 full moves. "
     "Source: https://github.com/Kriegspiel/bot-gpt-sol-agent"
 )
 GAME_ID = re.compile(r"[a-zA-Z0-9]{6,32}")
 LESSON_REFRESH_INTERVAL = 10
+LESSON_SEARCH_SECONDS = 1.5
+LESSON_INDEX_SECONDS = 10.0
 
 
 class GameAPI:
@@ -117,7 +119,7 @@ class Player:
         self.current_turn = None
         self.budget = None
         self.model_calls = 0
-        self.lesson_refresh_move = 0
+        self.lesson_refresh_move = -1
         self.lessons = memory.open_game(
             self.game_id, game_code=self.game_code, variant=self.variant, own_color=self.color,
             opponent_key=game.get("opponent_id"), opponent_role=opponent["role"],
@@ -131,6 +133,40 @@ class Player:
             return {"state": state.get("state")}, sampled_at
         return project(state, self.color, self.variant), sampled_at
 
+    def refresh_lessons(self, state: dict, checkpoint: int) -> None:
+        try:
+            saved = self.memory.saved_lesson_selection(self.game_id, checkpoint)
+            if saved is not None:
+                self.lessons, source = saved, "saved"
+            else:
+                vector = None
+                now = self.now()
+                if (
+                    self.budget.model_until - now >= MIN_PLAY_REQUEST_SECONDS + LESSON_SEARCH_SECONDS
+                    and self.memory.has_indexed_lessons(self.game_id)
+                ):
+                    deadline = now + LESSON_SEARCH_SECONDS
+                    future = self.provider.start_embedding(
+                        inputs=[lesson_query(state)], deadline=deadline,
+                        purpose="lesson_search", game_id=self.game_id,
+                    )
+                    if future is not None:
+                        try:
+                            vector, = future.result(timeout=max(0, deadline - self.now()))
+                        except (TimeoutError, OSError, RuntimeError, ValueError, requests.RequestException):
+                            future.cancel()
+                            LOG.info("lesson search fallback game=%s", self.game_code)
+                self.lessons = self.memory.refresh_lessons(self.game_id, checkpoint, query_vector=vector)
+                source = "semantic" if vector is not None else "confidence"
+        except SQLiteError:
+            LOG.warning("could not refresh lessons game=%s after_moves=%s", self.game_code, checkpoint)
+            return
+        self.lesson_refresh_move = checkpoint
+        LOG.info(
+            "loaded lesson snapshot game=%s after_moves=%s lessons=%s source=%s",
+            self.game_code, checkpoint, len(self.lessons), source,
+        )
+
     def play(self, state: dict, sampled_at: float, stop: threading.Event) -> None:
         expected = turn_key(state)
         if self.current_turn != expected:
@@ -142,17 +178,8 @@ class Player:
             self.model_calls = 0
             completed_moves = full_move_number(state) - 1
             checkpoint = completed_moves - completed_moves % LESSON_REFRESH_INTERVAL
-            if checkpoint > self.lesson_refresh_move:
-                try:
-                    self.lessons = self.memory.refresh_lessons(self.game_id, checkpoint)
-                except SQLiteError:
-                    LOG.warning("could not refresh lessons game=%s after_moves=%s", self.game_code, checkpoint)
-                else:
-                    self.lesson_refresh_move = checkpoint
-                    LOG.info(
-                        "loaded lesson snapshot game=%s after_moves=%s lessons=%s",
-                        self.game_code, checkpoint, len(self.lessons),
-                    )
+            if checkpoint > self.lesson_refresh_move and not stop.is_set():
+                self.refresh_lessons(state, checkpoint)
         budget = self.budget
         journal_key = f"{self.color}:{state['move_number']}"
         rejected = self.memory.tried_actions(self.game_id, journal_key) | ongoing_rejections(state)
@@ -310,6 +337,26 @@ class Worker:
             raise ModelUnavailable("review provider busy")
         return future.result(timeout=65)
 
+    def index_lessons(self) -> None:
+        lessons = self.memory.unindexed_lessons()
+        if not lessons or self.stop.is_set():
+            return
+        inputs = [
+            f"{lesson['phase'].capitalize()} lesson. {lesson['observation']} {lesson['adjustment']}"
+            for lesson in lessons
+        ]
+        future = self.provider.start_embedding(
+            inputs=inputs, deadline=time.monotonic() + LESSON_INDEX_SECONDS,
+            purpose="lesson_index", game_id="batch",
+        )
+        if future is None:
+            return
+        vectors = future.result(timeout=LESSON_INDEX_SECONDS)
+        self.memory.save_lesson_embeddings([
+            (lesson["id"], vector) for lesson, vector in zip(lessons, vectors, strict=True)
+        ])
+        LOG.info("indexed lessons count=%s", len(lessons))
+
     def review_loop(self) -> None:
         reviewer = ReviewWorker(self.memory, fetch_review=self.fetch_review, model_review=self.model_review)
         try:
@@ -318,6 +365,10 @@ class Worker:
                     reviewer.run_once()
                 except (TimeoutError, RuntimeError, OSError, ValueError, requests.RequestException):
                     LOG.warning("postgame review postponed")
+                try:
+                    self.index_lessons()
+                except (SQLiteError, TimeoutError, RuntimeError, OSError, ValueError, requests.RequestException):
+                    LOG.warning("lesson indexing postponed")
         finally:
             self.api.close()
 

@@ -9,7 +9,7 @@ from unittest.mock import Mock, call, patch
 
 import requests
 
-from provider import Provider, response_text
+from provider import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, ModelUnavailable, Provider, response_text
 from provider_budget import MonthlyBudgetLedger
 
 
@@ -25,6 +25,15 @@ def response(output=None):
         ],
         "usage": {"input_tokens": 1000, "output_tokens": 200, "input_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 300}},
     }
+
+
+def embedding_response(*rows):
+    mock_response = Mock(status_code=200)
+    mock_response.json.return_value = {
+        "data": [{"index": index, "embedding": vector} for index, vector in rows],
+        "usage": {"prompt_tokens": 100, "total_tokens": 100},
+    }
+    return mock_response
 
 
 class ProviderTests(unittest.TestCase):
@@ -197,6 +206,106 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(post.call_count, 2)
         with patch("provider.requests.get", return_value=healthy):
             self.assertEqual(provider.availability(), (True, ""))
+
+    def test_embeddings_preserve_input_order_and_settle_shared_budget(self):
+        with TemporaryDirectory() as directory:
+            ledger = MonthlyBudgetLedger(Path(directory) / "openai.json", limit_usd=1)
+            live_report = Mock()
+            provider = Provider("mock", "test-sol", ledger, live_report)
+            first = [3, 4, *([0] * (EMBEDDING_DIMENSIONS - 2))]
+            second = [0, -2, *([0] * (EMBEDDING_DIMENSIONS - 2))]
+            inputs = ["lesson about pawn captures", "lesson about checking rays"]
+            with self.assertLogs("provider", level="INFO") as logs, patch(
+                "provider.requests.post", return_value=embedding_response((1, second), (0, first)),
+            ) as post:
+                future = provider.start_embedding(
+                    inputs=inputs, deadline=time.monotonic() + 2, purpose="lesson_index", game_id="ABC234",
+                )
+                vectors = future.result(timeout=2)
+
+            self.assertEqual(vectors[0], [0.6, 0.8, *first[2:]])
+            self.assertEqual(vectors[1], [0.0, -1.0, *second[2:]])
+            self.assertEqual(post.call_args.args, ("https://api.openai.com/v1/embeddings",))
+            self.assertEqual(post.call_args.kwargs["json"], {
+                "model": EMBEDDING_MODEL, "input": inputs,
+                "dimensions": EMBEDDING_DIMENSIONS, "encoding_format": "float",
+            })
+            self.assertLessEqual(sum(post.call_args.kwargs["timeout"]), 2)
+            self.assertAlmostEqual(ledger.status().spent_usd, 0.000002)
+            self.assertEqual(ledger.status().reserved_usd, 0.0)
+            self.assertIn("purpose=lesson_index game=ABC234 model=text-embedding-3-small", logs.output[0])
+            self.assertIn("cost_usd=0.00000200 accounting=reported input_tokens=100", logs.output[0])
+            live_report.assert_not_called()
+
+    def test_bad_vectors_are_rejected_and_reported_usage_is_settled(self):
+        valid = [1, *([0] * (EMBEDDING_DIMENSIONS - 1))]
+        invalid_responses = (
+            embedding_response((0, valid[:-1]), (1, valid)),
+            embedding_response((0, valid), (0, valid)),
+            embedding_response((0, [float("nan"), *valid[1:]]), (1, valid)),
+            embedding_response((0, [0] * EMBEDDING_DIMENSIONS), (1, valid)),
+        )
+        with TemporaryDirectory() as directory:
+            ledger = MonthlyBudgetLedger(Path(directory) / "openai.json", limit_usd=1)
+            for response in invalid_responses:
+                provider = Provider("mock", "test-sol", ledger, Mock())
+                with self.subTest(response=response.json.return_value), patch(
+                    "provider.requests.post", return_value=response,
+                ):
+                    future = provider.start_embedding(
+                        inputs=["one", "two"], deadline=time.monotonic() + 2,
+                        purpose="lesson_index", game_id="ABC234",
+                    )
+                    with self.assertRaises(ValueError):
+                        future.result(timeout=2)
+            self.assertAlmostEqual(ledger.status().spent_usd, 0.000002 * len(invalid_responses))
+            self.assertEqual(ledger.status().reserved_usd, 0.0)
+
+    def test_embedding_budget_and_deadline_can_skip_provider_request(self):
+        ledger = Mock()
+        ledger.reserve.return_value = None
+        provider = Provider("mock", "test-sol", ledger, Mock())
+
+        def start(seconds):
+            return provider.start_embedding(
+                inputs=["lesson query"], deadline=time.monotonic() + seconds,
+                purpose="lesson_search", game_id="ABC234",
+            )
+
+        with patch("provider.requests.post") as post:
+            self.assertIsNone(start(0))
+            ledger.reserve.assert_not_called()
+            future = start(2)
+            with self.assertRaisesRegex(ModelUnavailable, "budget exhausted"):
+                future.result(timeout=2)
+            post.assert_not_called()
+            ledger.settle.assert_not_called()
+
+    def test_embedding_backoff_and_admission_are_separate_from_play(self):
+        provider = Provider("mock", "test-sol", Mock(), Mock())
+        limited = Mock(status_code=429)
+        limited.raise_for_status.side_effect = requests.HTTPError()
+        vector = [1, *([0] * (EMBEDDING_DIMENSIONS - 1))]
+
+        def start(purpose):
+            return provider.start_embedding(
+                inputs=["lesson query"], deadline=time.monotonic() + 2, purpose=purpose, game_id="ABC234",
+            )
+
+        with patch("provider.requests.post", side_effect=[limited, embedding_response((0, vector))]) as post:
+            gate = provider.gates["lesson_search"]
+            gate.acquire()
+            try:
+                self.assertIsNone(start("lesson_search"))
+                post.assert_not_called()
+            finally:
+                gate.release()
+            with self.assertRaises(requests.HTTPError):
+                start("lesson_search").result(timeout=2)
+            self.assertIsNone(start("lesson_search"))
+            self.assertEqual(start("lesson_index").result(timeout=2), [vector])
+            self.assertEqual(provider.retry_ready_at["play"], 0.0)
+            self.assertEqual(post.call_count, 2)
 
 
 if __name__ == "__main__":

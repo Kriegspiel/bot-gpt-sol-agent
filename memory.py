@@ -5,14 +5,18 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+from math import sumprod
 from pathlib import Path
 import sqlite3
+from struct import Struct
 import time
 from typing import Any, Iterator
 
 from clock_policy import REASONING_EFFORTS, reasoning_expectations
+from provider import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 
 _MAX_ADVICE = 6
+_EMBEDDING_VECTOR = Struct(f"<{EMBEDDING_DIMENSIONS}f")
 _LESSON_REFRESH_TIMEOUT_SECONDS = 0.25
 _CHECK_INTERVAL = 120
 _RETRY_INTERVAL = 300
@@ -67,6 +71,13 @@ CREATE TABLE IF NOT EXISTS lessons (
     status TEXT NOT NULL DEFAULT 'candidate'
 );
 CREATE INDEX IF NOT EXISTS lessons_retrieval ON lessons(variant, status, opponent_key);
+CREATE TABLE IF NOT EXISTS lesson_embeddings (
+    lesson_id INTEGER NOT NULL REFERENCES lessons(id),
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY (lesson_id, model, dimensions)
+);
 CREATE TABLE IF NOT EXISTS model_timings (
     id INTEGER PRIMARY KEY,
     model TEXT NOT NULL,
@@ -203,18 +214,65 @@ class MemoryStore:
                 timings.setdefault(row["effort"], []).append((row["seconds"], bool(row["timed_out"])))
         return timings
 
-    def _snapshot(self, db: sqlite3.Connection, variant: str, opponent_key: str | None) -> list[dict]:
+    def unindexed_lessons(self, limit: int = 32) -> list[dict]:
+        with self._connect() as db:
+            if not self._learning_enabled(db):
+                return []
+            return [dict(row) for row in db.execute(
+                """SELECT id, phase, observation, adjustment FROM lessons AS l
+                   WHERE status = 'approved' AND NOT EXISTS (
+                       SELECT 1 FROM lesson_embeddings AS e
+                       WHERE e.lesson_id = l.id AND e.model = ? AND e.dimensions = ?
+                   ) ORDER BY l.id LIMIT ?""", (EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, max(0, min(limit, 32))),
+            )]
+
+    def save_lesson_embeddings(self, embeddings: list[tuple[int, list[float]]]) -> None:
+        """Store a batch of normalized vectors for lessons still approved."""
+        with self._connect() as db:
+            db.executemany(
+                """INSERT INTO lesson_embeddings(lesson_id, model, dimensions, vector)
+                   SELECT id, ?, ?, ? FROM lessons WHERE id = ? AND status = 'approved'
+                   ON CONFLICT(lesson_id, model, dimensions) DO NOTHING""",
+                [(EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, _EMBEDDING_VECTOR.pack(*vector), lesson_id)
+                 for lesson_id, vector in embeddings],
+            )
+
+    def has_indexed_lessons(self, game_id: str) -> bool:
+        with self._connect(timeout=_LESSON_REFRESH_TIMEOUT_SECONDS) as db:
+            if not (self.use_memory and self._learning_enabled(db)):
+                return False
+            return db.execute(
+                """SELECT 1 FROM games AS g JOIN lessons AS l ON l.variant = g.variant
+                   JOIN lesson_embeddings AS e ON e.lesson_id = l.id AND e.model = ? AND e.dimensions = ?
+                   WHERE g.game_id = ? AND l.status = 'approved'
+                     AND (l.opponent_key IS NULL OR l.opponent_key = g.opponent_key) LIMIT 1""",
+                (EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, game_id),
+            ).fetchone() is not None
+
+    def _snapshot(
+        self, db: sqlite3.Connection, variant: str, opponent_key: str | None, query_vector: list[float] | None = None,
+    ) -> list[dict]:
+        def similarity(value: bytes | None) -> float | None:
+            if value is None or query_vector is None:
+                return None
+            return sumprod(query_vector, _EMBEDDING_VECTOR.unpack(value))
+
+        db.create_function("lesson_similarity", 1, similarity, deterministic=True)
+        model = EMBEDDING_MODEL if query_vector is not None else None
         # Keep room for general play even when there is lots of head-to-head evidence.
         notes = []
         targets = [(opponent_key, 2), (None, 4)] if opponent_key else [(None, 4)]
         for key, limit in targets:
             notes.extend(
                 db.execute(
-                    """SELECT id, phase, observation, adjustment, confidence, opponent_key
-                       FROM lessons WHERE variant = ? AND status = 'approved' AND opponent_key IS ?
-                       ORDER BY CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-                                id DESC LIMIT ?""",
-                    (variant, key, limit),
+                    """SELECT l.id, l.phase, l.observation, l.adjustment, l.confidence, l.opponent_key
+                       FROM lessons AS l LEFT JOIN lesson_embeddings AS e
+                           ON e.lesson_id = l.id AND e.model = ? AND e.dimensions = ?
+                       WHERE l.variant = ? AND l.status = 'approved' AND l.opponent_key IS ?
+                       ORDER BY lesson_similarity(e.vector) DESC NULLS LAST,
+                                CASE l.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                                l.id DESC LIMIT ?""",
+                    (model, EMBEDDING_DIMENSIONS, variant, key, limit),
                 ).fetchall()
             )
         return [
@@ -253,20 +311,32 @@ class MemoryStore:
                 return advice
             return json.loads(game["snapshot"])
 
-    def refresh_lessons(self, game_id: str, completed_moves: int) -> list[dict]:
+    def _saved_lesson_selection(
+        self, db: sqlite3.Connection, game_id: str, completed_moves: int,
+    ) -> list[dict] | None:
+        row = db.execute(
+            """SELECT snapshot FROM lesson_refreshes WHERE game_id = ? AND completed_moves >= ?
+               ORDER BY completed_moves DESC LIMIT 1""", (game_id, completed_moves),
+        ).fetchone()
+        return json.loads(row["snapshot"]) if row is not None else None
+
+    def saved_lesson_selection(self, game_id: str, completed_moves: int) -> list[dict] | None:
+        with self._connect(timeout=_LESSON_REFRESH_TIMEOUT_SECONDS) as db:
+            return self._saved_lesson_selection(db, game_id, completed_moves)
+
+    def refresh_lessons(
+        self, game_id: str, completed_moves: int, *, query_vector: list[float] | None = None,
+    ) -> list[dict]:
         """Save one selection per checkpoint and reuse it after a restart."""
         with self._connect(timeout=_LESSON_REFRESH_TIMEOUT_SECONDS) as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute(
-                """SELECT completed_moves, snapshot FROM lesson_refreshes WHERE game_id = ?
-                   ORDER BY completed_moves DESC LIMIT 1""", (game_id,),
-            ).fetchone()
-            if previous is not None and previous["completed_moves"] >= completed_moves:
-                return json.loads(previous["snapshot"])
+            previous = self._saved_lesson_selection(db, game_id, completed_moves)
+            if previous is not None:
+                return previous
             game = db.execute("SELECT variant, opponent_key FROM games WHERE game_id = ?", (game_id,)).fetchone()
             advice = []
             if self._learning_enabled(db) and self.use_memory:
-                advice = self._snapshot(db, game["variant"], game["opponent_key"])
+                advice = self._snapshot(db, game["variant"], game["opponent_key"], query_vector)
             db.execute(
                 "INSERT INTO lesson_refreshes(game_id, completed_moves, snapshot) VALUES (?, ?, ?)",
                 (game_id, completed_moves, _json(advice)),
@@ -450,8 +520,14 @@ class MemoryStore:
                 )
             ]
             learning_enabled = self._learning_enabled(db)
+            indexed_lesson_count = db.execute(
+                """SELECT COUNT(*) FROM lesson_embeddings AS e JOIN lessons AS l ON l.id = e.lesson_id
+                   WHERE l.status = 'approved' AND e.model = ? AND e.dimensions = ?""",
+                (EMBEDDING_MODEL, EMBEDDING_DIMENSIONS),
+            ).fetchone()[0]
         return {
             "learning_enabled": learning_enabled, "games": games, "lessons": lessons,
+            "indexed_lesson_count": indexed_lesson_count,
             "model_timing_counts": model_timings,
             "model_reasoning_seconds": {
                 model: {
