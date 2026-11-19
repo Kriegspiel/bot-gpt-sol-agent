@@ -10,9 +10,15 @@ import sqlite3
 import time
 from typing import Any, Iterator
 
+from clock_policy import REASONING_EFFORTS, reasoning_expectations
+
 _MAX_ADVICE = 6
 _CHECK_INTERVAL = 120
 _RETRY_INTERVAL = 300
+_TIMING_HISTORY_PER_EFFORT = 20
+_TIMING_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_TIMING_MAX_DURATION_SECONDS = 300
+_TIMING_DB_TIMEOUT_SECONDS = 0.25
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -54,6 +60,15 @@ CREATE TABLE IF NOT EXISTS lessons (
     status TEXT NOT NULL DEFAULT 'candidate'
 );
 CREATE INDEX IF NOT EXISTS lessons_retrieval ON lessons(variant, status, opponent_key);
+CREATE TABLE IF NOT EXISTS model_timings (
+    id INTEGER PRIMARY KEY,
+    model TEXT NOT NULL,
+    effort TEXT NOT NULL,
+    seconds REAL NOT NULL,
+    timed_out INTEGER NOT NULL CHECK (timed_out IN (0, 1)),
+    observed_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS model_timings_recent ON model_timings(model, effort, id DESC);
 """
 
 _CLOCK_FIELDS = ("white_remaining", "black_remaining", "active_color")
@@ -76,6 +91,13 @@ def _pick(source: object, fields: tuple[str, ...]) -> dict:
     if not isinstance(source, dict):
         return {}
     return {field: source[field] for field in fields if field in source}
+
+
+def _valid_timing_model(model: str) -> bool:
+    return (
+        isinstance(model, str) and 1 <= len(model) <= 200
+        and model.isprintable() and not any(char.isspace() for char in model)
+    )
 
 
 def _visible_turns(state: dict, own_color: str) -> list[dict]:
@@ -110,8 +132,8 @@ class MemoryStore:
             db.executescript(_SCHEMA)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=5)
+    def _connect(self, *, timeout: float = 5) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(self.path, timeout=timeout)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
         try:
@@ -135,6 +157,44 @@ class MemoryStore:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                 (int(enabled),),
             )
+
+    def record_model_timing(self, model: str, effort: str, seconds: float, *, timed_out: bool) -> None:
+        """Keep a bounded window of live provider observations."""
+        if (
+            not _valid_timing_model(model) or effort not in REASONING_EFFORTS
+            or type(seconds) not in (float, int) or not 0 < seconds <= _TIMING_MAX_DURATION_SECONDS
+            or not isinstance(timed_out, bool)
+        ):
+            return
+        observed_at = time.time()
+        with self._connect(timeout=_TIMING_DB_TIMEOUT_SECONDS) as db:
+            db.execute("DELETE FROM model_timings WHERE observed_at < ?", (observed_at - _TIMING_MAX_AGE_SECONDS,))
+            db.execute(
+                "INSERT INTO model_timings(model, effort, seconds, timed_out, observed_at) VALUES (?, ?, ?, ?, ?)",
+                (model, effort, seconds, int(timed_out), observed_at),
+            )
+            db.execute(
+                """DELETE FROM model_timings WHERE model = ? AND effort = ? AND id IN (
+                       SELECT id FROM model_timings WHERE model = ? AND effort = ?
+                       ORDER BY id DESC LIMIT -1 OFFSET ?
+                   )""",
+                (model, effort, model, effort, _TIMING_HISTORY_PER_EFFORT),
+            )
+
+    def model_timings(self, model: str) -> dict[str, list[tuple[float, bool]]]:
+        """Return unexpired durations and timeout flags, newest first within each effort."""
+        if not _valid_timing_model(model):
+            return {}
+        timings: dict[str, list[tuple[float, bool]]] = {}
+        with self._connect(timeout=_TIMING_DB_TIMEOUT_SECONDS) as db:
+            rows = db.execute(
+                """SELECT effort, seconds, timed_out FROM model_timings
+                   WHERE model = ? AND observed_at >= ? ORDER BY id DESC LIMIT ?""",
+                (model, time.time() - _TIMING_MAX_AGE_SECONDS, _TIMING_HISTORY_PER_EFFORT * len(REASONING_EFFORTS)),
+            )
+            for row in rows:
+                timings.setdefault(row["effort"], []).append((row["seconds"], bool(row["timed_out"])))
+        return timings
 
     def _snapshot(self, db: sqlite3.Connection, variant: str, opponent_key: str | None) -> list[dict]:
         # Keep room for general play even when there is lots of head-to-head evidence.
@@ -338,7 +398,25 @@ class MemoryStore:
                 {**dict(row), "evidence_plies": json.loads(row["evidence_plies"])}
                 for row in db.execute("SELECT * FROM lessons ORDER BY id DESC LIMIT ?", (limit,))
             ]
-            return {"learning_enabled": self._learning_enabled(db), "games": games, "lessons": lessons}
+            model_timings = [
+                dict(row) for row in db.execute(
+                    """SELECT model, effort, COUNT(*) AS samples, SUM(timed_out) AS timeouts
+                       FROM model_timings WHERE observed_at >= ? GROUP BY model, effort
+                       ORDER BY model, effort""", (time.time() - _TIMING_MAX_AGE_SECONDS,),
+                )
+            ]
+            learning_enabled = self._learning_enabled(db)
+        return {
+            "learning_enabled": learning_enabled, "games": games, "lessons": lessons,
+            "model_timing_counts": model_timings,
+            "model_reasoning_seconds": {
+                model: {
+                    effort: round(seconds, 2)
+                    for effort, seconds in reasoning_expectations(self.model_timings(model)).items()
+                }
+                for model in sorted({row["model"] for row in model_timings})
+            },
+        }
 
 
 def main() -> None:

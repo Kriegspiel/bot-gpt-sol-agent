@@ -5,7 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import requests
 
@@ -60,6 +60,61 @@ class ProviderTests(unittest.TestCase):
             self.assertAlmostEqual(ledger.status().spent_usd, 0.00792)
             self.assertAlmostEqual(reports[0]["cost_usd"], 0.00396)
             self.assertEqual(len(reports), 1)
+
+    def test_live_max_request_uses_remaining_deadline(self):
+        provider = Provider("mock", "gpt-6.2-sol", Mock(), Mock())
+        mock_response = Mock(status_code=200)
+        mock_response.json.return_value = response()
+        with patch("provider.time.monotonic", return_value=100), patch(
+            "provider.requests.post", return_value=mock_response,
+        ) as post:
+            provider._request(
+                purpose="play", game_id="ABC234", instructions="test", context={},
+                schema={}, deadline=170, effort="max", max_tokens=8192,
+            )
+        request = post.call_args.kwargs
+        self.assertEqual(request["json"]["reasoning"], {"effort": "max"})
+        self.assertEqual(request["json"]["max_output_tokens"], 8192)
+        self.assertEqual(request["timeout"], (2, 68))
+
+    def test_live_latency_is_recorded_with_a_distinct_timeout_flag(self):
+        with TemporaryDirectory() as directory:
+            ledger = MonthlyBudgetLedger(Path(directory) / "openai.json", limit_usd=1)
+            recorder = Mock()
+            provider = Provider("mock", "gpt-6.2-sol", ledger, Mock(), record_timing=recorder)
+            mock_response = Mock(status_code=200)
+            mock_response.json.return_value = response()
+            now = [100]
+
+            def respond(*_args, **_kwargs):
+                now[0] += 20
+                return mock_response
+
+            def timeout(*_args, **_kwargs):
+                now[0] += 35
+                raise requests.ReadTimeout()
+
+            def request(purpose):
+                return provider._request(
+                    purpose=purpose, game_id="ABC234", instructions="test", context={},
+                    schema={}, deadline=now[0] + 70, effort="max", max_tokens=8192,
+                )
+
+            with patch("provider.time.monotonic", side_effect=lambda: now[0]):
+                with patch("provider.requests.post", side_effect=respond):
+                    request("play")
+                    request("review")
+                    mock_response.json.return_value = {**response(), "status": "incomplete"}
+                    with self.assertRaises(ValueError):
+                        request("play")
+                with patch("provider.requests.post", side_effect=timeout):
+                    with self.assertRaises(requests.ReadTimeout):
+                        request("play")
+
+            self.assertEqual(recorder.call_args_list, [
+                call("gpt-6.2-sol", "max", 20, timed_out=False),
+                call("gpt-6.2-sol", "max", 35, timed_out=True),
+            ])
 
     def test_two_live_requests_and_one_review_run_together(self):
         provider = Provider("mock", "test-sol", Mock(), Mock())

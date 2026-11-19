@@ -41,6 +41,8 @@ def completed_future(value):
 
 
 class FakeProvider:
+    model = "gpt-6.2-sol"
+
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests = []
@@ -104,6 +106,39 @@ class PlayerTests(unittest.TestCase):
         self.assertEqual(len(api.calls), 1)
         self.assertIn(api.calls[0][2]["uci"], live["allowed_moves"])
 
+    def test_live_play_sends_max_with_time_for_deeper_reasoning(self):
+        live = state(remaining=1500, ask=False)
+        api = FakeAPI([live], [{"move_done": True}])
+        provider = FakeProvider({"attempts": ["e2e4"], "hypotheses": [], "rationale": "Contests the center."})
+        self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        self.assertEqual(provider.requests[0]["effort"], "max")
+        self.assertEqual(api.calls[-1][2], {"uci": "e2e4"})
+
+    def test_slow_measured_max_sends_a_lower_effort(self):
+        live = state(remaining=1500, ask=False)
+        api = FakeAPI([live], [{"move_done": True}])
+        provider = FakeProvider({"attempts": ["e2e4"], "hypotheses": [], "rationale": ""})
+        self.memory.record_model_timing(provider.model, "max", 80, timed_out=True)
+        self.create(provider, api).play(project(live, "white"), 100, threading.Event())
+        self.assertEqual(provider.requests[0]["effort"], "xhigh")
+
+    def test_accepted_fallback_move_records_turn_elapsed(self):
+        live = state(remaining=4, ask=False)
+        api = FakeAPI([], [{"move_done": True}])
+        original_post = api.post
+        now = [100.0]
+
+        def submit(*args, **kwargs):
+            now[0] += 0.5
+            return original_post(*args, **kwargs)
+
+        api.post = submit
+        player = Player(GAME, api, self.memory, FakeProvider(), now=lambda: now[0])
+        player.play(project(live, "white"), 100, threading.Event())
+        accepted = self.memory.review_context(GAME["game_id"])[-1]
+        self.assertTrue(accepted["answer"]["move_done"])
+        self.assertEqual(accepted["decision"]["elapsed_ms"], 500)
+
     def test_stale_model_output_is_discarded(self):
         live = state(remaining=350)
         api = FakeAPI([{**live, "turn": "black", "ply_count": 5}], [])
@@ -126,7 +161,8 @@ class PlayerTests(unittest.TestCase):
         api = FakeAPI([live], [{"move_done": True}])
         provider = FakeProvider(future)
         self.create(provider, api).play(project(live, "white"), 100, threading.Event())
-        self.assertLess(future.sampled_timeout, 10)
+        self.assertEqual(provider.requests[0]["effort"], "low")
+        self.assertLess(future.sampled_timeout, 18)
         self.assertEqual(api.calls[-1][0], "POST")
 
     def test_fallback_submission_survives_bounded_provider_admission(self):
@@ -134,7 +170,7 @@ class PlayerTests(unittest.TestCase):
         live = state(remaining=1500)
         answer = {"move_done": True}
         api = FakeAPI([], [answer])
-        provider = Mock()
+        provider = Mock(model="gpt-6.2-sol")
 
         def admission(*, deadline, **_):
             now[0] = deadline

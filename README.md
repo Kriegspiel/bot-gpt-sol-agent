@@ -14,6 +14,24 @@ runner budgets from the server clock and can submit a locally ranked attempt
 when inference is slow or unavailable. It rechecks the state after a model request, re-ranks
 after every referee answer and journals submission intents before posting them.
 
+Live decisions budget from the remaining clock and a historical 75th-percentile
+checkmate horizon based on public board material, the opponent's role, and the
+drop variant. The agent protects a clock reserve and can spend more of a large
+clock surplus on a turn. Paid play selects `low`, `medium`, `high`, `xhigh`, or
+`max` as time permits. It uses local fallback if there is too little time to
+start inference. The live turn budget is capped at 90 seconds, with a separate
+30-second cap while the clock is idle before the first move. Both budgets
+leave four seconds for refreshing and submitting a move.
+
+The journal records elapsed turn time from first observing the turn through
+each referee reply. The agent tracks live provider latency separately for
+each model and effort. It keeps up to 20 measurements per effort for seven
+days. The cold-start thresholds are 5, 18, 30, 45, and 60 seconds. A padded
+75th percentile of observations recalibrates which effort fits the available
+time. Timeouts supply a lower bound, and three completed requests are
+required before a threshold can fall below its default. Inspect current
+requirements after the first observations with `python -m memory --db PATH status`.
+
 A separate worker reviews one of the agent's own completed games at a time,
 even while other games are active. It uses a separate model request slot and
 can compare full replay with the evidence available to the player at the time.
